@@ -212,7 +212,7 @@ def _safe_index(tensor, idx):
 
 
 
-def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False, iteration= 0, ape_code=-1, is_pbr=False):
+def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False, iteration= 0, ape_code=-1, is_pbr=False, normal_smooth_weight=0.0):
     ## view frustum filtering for acceleration
     global roughness, albedo, matallic
     indices = _bool_to_indices(visible_mask)
@@ -236,10 +236,14 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             offset_indices = offset_indices.reshape(-1)
     else:
         offset_indices = None
-    # _offset is [N*K, 3] — already flat, no reshape needed
+    # FIX (M2/root-cause): pc._offset is [N, K, 3]; index dim 0 with the ANCHOR
+    # indices (∈ [0, N)) exactly like PT GANG's `pc._offset[visible_mask]`.
+    # The previous offset_indices (= indices*K + j, up to N*K) over-indexed the
+    # [N,K,3] tensor by K× → ~2.25M OOB reads per view (garbage offsets; crashed
+    # at res=1). view(-1,3) below flattens [M,K,3] → [M*K, 3].
     grid_offsets = pc._offset
     if indices is not None:
-        grid_offsets = _safe_index(grid_offsets, offset_indices)
+        grid_offsets = _safe_index(grid_offsets, indices)
     # _scaling is anchor-level [N, 6]
     grid_scaling = _idx(pc.get_scaling)
 
@@ -456,29 +460,33 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     # === Manual grad diagnostic capture (Phase 22) ===
     # Store intermediate tensors for manual gradient computation.
-    # These are read via cupy in utils/manual_grad.py:compute_geometry_grads()
-    pc._diag_data = {
-        'scaling_repeat': scaling_repeat,        # [G, 6]
-        'rotation_repeat': rotation_repeat,      # [G, 4]
-        'scale_rot_filtered': scale_rot_filtered,  # [G, 7]
-        'offsets_filtered': offsets_filtered,    # [G, 3]
-        'grid_scaling': grid_scaling,            # [M, 6]
-        'grid_rotation': grid_rotation,          # [M, 4]
-        'anchor_M': anchor,                      # [M, 3] (before expand)
-        'mask_indices': mask_indices,            # [G] numpy int64
-        'visible_indices': indices,              # [M] numpy int64 (may be None)
-        'expand_np': _expand_np,                 # [M*K] numpy int32
-        'offsets_MK': offsets,                   # [M*K, 3]
-        'scale_rot_MK': scale_rot,               # [M*K, 7] (MLP output, pre-filter)
-        'offset_indices': offset_indices if 'offset_indices' in dir() else None,  # [M*K] numpy
-        # Phase 30: MLP backward inputs
-        'mlp_opacity_input': _opacity_input if '_opacity_input' in dir() else None,
-        'mlp_cov_input': _cov_input if '_cov_input' in dir() else None,
-        'mlp_color_input': _color_input if '_color_input' in dir() else None,
-        # Phase 39: PBR MLP backward inputs
-        'is_pbr': is_pbr,
-        'mlp_pbr_input': _opacity_input if '_opacity_input' in dir() else None,
-    }
+    # These are read via cupy in utils/manual_grad.py:compute_geometry_grads().
+    # M2 (P0): gate behind is_training — in inference this dict held ~200-300MiB of
+    # [G,*] tensors on the model object across views (a training scratch-buffer leak
+    # that caused single-process multi-view memory accumulation + SFRL illegal address).
+    if is_training:
+        pc._diag_data = {
+            'scaling_repeat': scaling_repeat,        # [G, 6]
+            'rotation_repeat': rotation_repeat,      # [G, 4]
+            'scale_rot_filtered': scale_rot_filtered,  # [G, 7]
+            'offsets_filtered': offsets_filtered,    # [G, 3]
+            'grid_scaling': grid_scaling,            # [M, 6]
+            'grid_rotation': grid_rotation,          # [M, 4]
+            'anchor_M': anchor,                      # [M, 3] (before expand)
+            'mask_indices': mask_indices,            # [G] numpy int64
+            'visible_indices': indices,              # [M] numpy int64 (may be None)
+            'expand_np': _expand_np,                 # [M*K] numpy int32
+            'offsets_MK': offsets,                   # [M*K, 3]
+            'scale_rot_MK': scale_rot,               # [M*K, 7] (MLP output, pre-filter)
+            'offset_indices': offset_indices if 'offset_indices' in dir() else None,  # [M*K] numpy
+            # Phase 30: MLP backward inputs
+            'mlp_opacity_input': _opacity_input if '_opacity_input' in dir() else None,
+            'mlp_cov_input': _cov_input if '_cov_input' in dir() else None,
+            'mlp_color_input': _color_input if '_color_input' in dir() else None,
+            # Phase 39: PBR MLP backward inputs
+            'is_pbr': is_pbr,
+            'mlp_pbr_input': _opacity_input if '_opacity_input' in dir() else None,
+        }
 
     view_dir = xyz - viewpoint_camera.camera_center.repeat(xyz.shape[0], 1)
     view_dir_normal = (view_dir/view_dir.norm(dim=1, keepdim=True)).detach() # (N, 3)
@@ -497,6 +505,24 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         normal = pc.computeNorm(scaling, rot,view_dir_normal)
         delta_normal_norm = None
+
+    # Sharp relighting exposes constant per-Gaussian normals as isolated
+    # highlights.  The K offsets emitted by one anchor describe one local
+    # neighbourhood, so inference may blend their view-aligned unit normals
+    # before SG evaluation.  Training and legacy rendering keep weight 0.
+    if (not is_training) and normal_smooth_weight > 0.0 and normal.shape[0] > 0:
+        group_idx = (mask_indices // pc.n_offsets).int32()
+        group_sum = jt.scatter(
+            jt.zeros((anchor.shape[0], 3), dtype=jt.float32),
+            0, group_idx, normal, reduce='add')
+        group_count = jt.scatter(
+            jt.zeros((anchor.shape[0], 1), dtype=jt.float32),
+            0, group_idx, jt.ones((normal.shape[0], 1), dtype=jt.float32),
+            reduce='add').clamp(min_v=1.0)
+        group_normal = jt.normalize(group_sum / group_count, p=2, dim=-1)
+        local_normal = group_normal[group_idx]
+        w = float(normal_smooth_weight)
+        normal = jt.normalize(normal * (1.0 - w) + local_normal * w, p=2, dim=-1)
 
 
     # Phase 93: sync to materialize non-PBR MLP outputs (opacity+color+cov+normal)
@@ -555,7 +581,104 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     scale_rot = scale_rot_filtered
 
     return xyz, color, opacity, scaling, rot, neural_opacity, mask, albedo, roughness, matallic,normal,delta_normal_norm,local_loss,sdf_loss
-   
+
+
+
+def generate_shadow_gaussians(pc, light_position, anchor_indices=None,
+                              viewdir_center=None, prog_ratio=None):
+    """P4.4 (§15.3): light-space shadow-caster decode — xyz/opacity/scaling/rot ONLY.
+
+    The transmit cubemap needs only geometry (xyz), opacity, scaling and rotation.
+    Decoding color / albedo / roughness / metallic / normal would waste memory on
+    the full-anchor light-space cloud, so this function skips them.
+
+    Physical fix (guide §P4.4.B.2): the opacity/cov MLPs are fed a VIEW DIRECTION
+    of `anchor - light_position` — the LIGHT is the shadow-ray origin — instead of
+    the main camera center. This removes the per-view-caster coupling measured in
+    §15.2 (the per-view caster used camera-visible gaussians + camera view dir).
+
+    N2 (§16.4): `viewdir_center` overrides the MLP view direction for the opacity
+    semantic A/B. `None` keeps the light-space direction (mode `ls`, the P4.4
+    default); a camera centre `c` makes the opacity/cov MLPs see `anchor - c`
+    (mode `canonical` / per-camera of `ensemble`) while the cubemap is still
+    rasterised FROM the light position. ALL anchors are always decoded — no
+    camera frustum prefilter is ever applied here.
+
+    Semantics mirror `generate_neural_gaussians()` exactly:
+      - opacity activation (Tanh), `> 0` mask (Phase 42), progressive ratio
+      - offset expansion [N,K]->[N*K], scaling sigmoid + Phase 44 clamp, rotation
+        normalize, xyz = anchor + offset*scaling
+      - `anchor_indices=None` decodes ALL anchors (bypass camera `_anchor_mask` /
+        `prefilter_voxel`); a light-space prefilter index set may be passed for
+        the 6-face sequential fallback (§15.4).
+    Returns (xyz, opacity, scaling, rot) each [G, *].
+    """
+    import numpy as np
+    indices = _bool_to_indices(anchor_indices) if anchor_indices is not None else None
+
+    def _idx(t):
+        return t if indices is None else _safe_index(t, indices)
+
+    anchor = _idx(pc.get_anchor)
+    feat = _idx(pc.get_anchor_feat)
+    level = _idx(pc.get_level)
+
+    # view direction for the opacity/cov MLPs: light-space by default (shadow ray
+    # origin = light position); N2 canonical/ensemble mode overrides to a camera
+    # centre so the MLP sees a training-distribution direction.
+    vc = jt.array(np.asarray(light_position, dtype=np.float32).reshape(-1))
+    if viewdir_center is not None:
+        vc = jt.array(np.asarray(viewdir_center, dtype=np.float32).reshape(-1))
+    ob_view = anchor - vc.unsqueeze(0)                       # [N,3]
+    ob_dist_raw = ob_view.norm(dim=1, keepdim=True)
+    ob_dist = ob_dist_raw / (ob_dist_raw.mean().detach() + 1e-8)
+    ob_view = ob_view / ob_dist_raw
+
+    if pc.add_level:
+        cat_local_view_wodist = jt.concat([feat, ob_view, level], dim=1)
+    else:
+        cat_local_view_wodist = jt.concat([feat, ob_view], dim=1)
+
+    neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
+    # N2.5-B: progressive fade is an EXPLICIT input, never read from the mutable
+    # `pc._prog_ratio` (which the last receiver view's set_anchor_mask may have
+    # written). dist2level='round' -> prog_ratio=None -> no fade.
+    if prog_ratio is not None:
+        prog = _idx(prog_ratio)
+        neural_opacity = neural_opacity * prog
+
+    neural_opacity = neural_opacity.reshape([-1, 1])
+    mask = (neural_opacity > 0.0).view(-1)                   # Phase 42 Tanh>0
+    mask_indices = _bool_to_indices(mask)
+    opacity = _safe_index(neural_opacity, mask_indices)
+
+    scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
+    scale_rot = scale_rot.reshape([anchor.shape[0] * pc.n_offsets, 7])
+
+    grid_offsets = _idx(pc._offset)
+    grid_rotation = _idx(pc._rotation)
+    grid_scaling = _idx(pc.get_scaling)
+    offsets = grid_offsets.view([-1, 3])
+
+    K = pc.n_offsets
+    N_anchor = anchor.shape[0]
+    _expand_np = np.arange(N_anchor, dtype=np.int32).repeat(K)
+    scaling_expanded = grid_scaling[_expand_np]              # [N*K, 6]
+    rotation_expanded = grid_rotation[_expand_np]            # [N*K, 4]
+    repeat_anchor = anchor[_expand_np]                       # [N*K, 3]
+
+    scaling_repeat = _safe_index(scaling_expanded, mask_indices)
+    rotation_repeat = _safe_index(rotation_expanded, mask_indices)
+    repeat_anchor = _safe_index(repeat_anchor, mask_indices)
+    scale_rot_filtered = _safe_index(scale_rot, mask_indices)
+    offsets_filtered = _safe_index(offsets, mask_indices)
+
+    scaling = scaling_repeat[:, 3:] * jt.sigmoid(scale_rot_filtered[:, :3])
+    scaling = scaling.maximum(1e-8).minimum(1.0)             # Phase 44 clamp
+    rot = pc.rotation_activation(rotation_repeat * scale_rot_filtered[:, 3:7])
+    offsets_out = offsets_filtered * scaling_repeat[:, :3]
+    xyz = repeat_anchor + offsets_out
+    return xyz, opacity, scaling, rot
 
 
 def scale_loss(scaling):
@@ -567,7 +690,7 @@ def scale_loss(scaling):
     return loss_scale
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scaling_modifier=1.0, visible_mask=None,is_pbr=False,light=None, retain_grad=False, is_training =True, Local_pkg=None,iteration = 0,ape_code=-1):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scaling_modifier=1.0, visible_mask=None,is_pbr=False,light=None, retain_grad=False, is_training =True, Local_pkg=None,iteration = 0,ape_code=-1, normalize_for_light=False, return_aux=True, normal_smooth_weight=0.0, return_light_components=False, shadow_ctx=None):
     """
     Render the scene. 
     
@@ -575,15 +698,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
     """
 
     # if is_training:
-    xyz, color, opacity, scaling, rot, neural_opacity, mask, albedo, roughness, matallic,normal,delta_normal_norm,local_loss,sdf_loss = generate_neural_gaussians(viewpoint_camera, pc,visible_mask,is_training=is_training,is_pbr=is_pbr,iteration= iteration,ape_code = ape_code)
+    xyz, color, opacity, scaling, rot, neural_opacity, mask, albedo, roughness, matallic,normal,delta_normal_norm,local_loss,sdf_loss = generate_neural_gaussians(
+        viewpoint_camera, pc, visible_mask, is_training=is_training,
+        is_pbr=is_pbr, iteration=iteration, ape_code=ape_code,
+        normal_smooth_weight=normal_smooth_weight)
 
-    loss_scale = scale_loss(scaling)
+    # scale_loss sorts every Gaussian scale and is only consumed by training.
+    loss_scale = scale_loss(scaling) if is_training else jt.float32(0.0)
     if pc.normal_detal:
         delta_normal_norm = delta_normal_norm.repeat(1, 3)
 
 
     screenspace_points = jt.zeros_like(xyz) + 0
-    screenspace_points.requires_grad = True
+    # M2 (P0): only the training path needs an autograd tape on screenspace_points;
+    # in inference the rasterizer runs inference-only (no tape, no save_for_backward).
+    if is_training:
+        screenspace_points.requires_grad = True
     if retain_grad:
         try:
             screenspace_points.retain_grad()
@@ -613,6 +743,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
+    # §30.5.2 E2-C identity vars are declared in the PBR branch below but read
+    # unconditionally on every return path (L1006). Non-PBR inference (25K render)
+    # needs them defined; the PBR branch overwrites these defaults.
+    receiver_query_meta = None
+    receiver_query_diag = None
+    receiver_transmittance = None
+
     if is_pbr:
 
         viewdirs = jt.normalize(viewpoint_camera.camera_center - xyz, p=2, dim=-1)
@@ -622,15 +759,130 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
             light.build_mips()
             light._mips_built = True
         
-        normal_t = normal * 0.5 + 0.5
+        # Keep the historical training path unchanged, but allow relighting
+        # inference to provide the unit world-space directions expected by SG
+        # and cubemap sampling.  [0,1] encoding remains only for raster output.
+        if normalize_for_light:
+            normal_for_light = jt.normalize(normal, p=2, dim=-1)
+        else:
+            normal_for_light = normal * 0.5 + 0.5
 
-        light_color, extras = light.lightRender(xyz, normal_t, albedo, roughness, matallic, viewdirs)
+        # P1-b shadow: build a 6-face depth cubemap from the lamp (reuses the
+        # already-materialised xyz/opacity/scaling/rot, no MLP re-run). Only in
+        # inference point-light mode when point_shadow_enabled.
+        shadow_cube = None
+        shadow_alpha = None
+        transmit_cube = None
+        transmit_bounds = None
+        transmit_final = None
+        receiver_query_meta = None       # §30.5.2 E2-C: exact query identity (pkg)
+        receiver_query_diag = None       # §30.5.2 E2-C: full schema-v3 diag (pkg, non-raster)
+        receiver_transmittance = None    # §30.5.2 E2-C: explicit [G,1] exact T -> light
+        if (not is_training and getattr(light, 'point_light_enabled', False)
+                and getattr(light, 'point_shadow_enabled', False)):
+            from utils.light_utils import render_shadow_cubemap, render_transmit_cubemap
+            if getattr(light, 'shadow_diag', False):
+                print(f"  [shadow-dbg] xyz{tuple(xyz.shape)} op{tuple(opacity.shape)} "
+                      f"sc{tuple(scaling.shape)} rot{tuple(rot.shape)}", flush=True)
+            if (shadow_ctx is not None
+                    and shadow_ctx.get('query_mode') == 'receiver_exact'):
+                # §30.5.2 E2-C: per-receiver exact transmittance. The receiver
+                # cloud is THIS view's xyz; the fixed caster tensors + identity
+                # come from the exact context. NO transmit_cube / transmit_final /
+                # transmit_bounds and NO depth cubemap. Metadata stays in the
+                # renderer (pkg) — only the explicit T reaches lightRender.
+                from utils.light_utils import render_receiver_transmittance
+                _rmeta = ('full' if shadow_ctx.get('dump_transmit_diag', False)
+                          else 'compact')
+                _T, _cm, _fd = render_receiver_transmittance(
+                    shadow_ctx['caster_xyz'], shadow_ctx['caster_opacity'],
+                    shadow_ctx['caster_scaling'], shadow_ctx['caster_rotation'],
+                    xyz, shadow_ctx['light_position'], shadow_ctx['shadow_res'],
+                    bias=float(shadow_ctx.get('bias', 0.02)),
+                    znear=float(shadow_ctx.get('znear', 0.01)),
+                    return_meta=_rmeta)
+                receiver_transmittance = _T
+                receiver_query_meta = dict(_cm)
+                receiver_query_meta['caster_sha256'] = shadow_ctx.get('caster_sha256')
+                receiver_query_meta['implementation_manifest_sha256'] = shadow_ctx.get(
+                    'source_manifest_sha256')
+                receiver_query_meta['shadow_ctx_build_count'] = shadow_ctx.get(
+                    'shadow_ctx_build_count', 1)
+                if _rmeta == 'full':
+                    receiver_query_diag = _fd
+            elif getattr(light, 'shadow_transmit', False):
+                # P4.4 (§15.5): reuse a pre-computed FIXED light-space shadow
+                # context when provided (built once before the view loop, from
+                # ALL anchors with view dir = anchor - light). Otherwise fall back
+                # to the historical per-view caster (camera-visible gaussians).
+                if shadow_ctx is not None:
+                    if 'samples' in shadow_ctx:
+                        # N4 (§21): per-emitter-sample ctx — no shared cube; each
+                        # emitter sample carries its own (used via emitter_transmit).
+                        transmit_cube = transmit_final = transmit_bounds = None
+                    else:
+                        transmit_cube = shadow_ctx['transmit_cube']
+                        transmit_final = shadow_ctx['transmit_final']
+                        transmit_bounds = shadow_ctx['transmit_bounds']
+                else:
+                    # P4.1: prefix-transmittance cubemap (semi-transparent shadow).
+                    # Contract: N boundaries -> N T(boundary) maps + 1 final-T map.
+                    transmit_cube, transmit_final, transmit_bounds = render_transmit_cubemap(
+                        xyz, opacity, scaling, rot,
+                        np.array(light.point_light_position.numpy(), dtype=np.float32),
+                        res=int(getattr(light, 'shadow_res', 512)),
+                        num_boundaries=int(getattr(light, 'shadow_buckets', 4)))
+                # §30.7.3 / §〇.31 E3: the FIXED boundary control carries the SAME
+                # per-view receiver identity the exact route computes, so
+                # method_identity_check(boundary, exact) can validate receiver /
+                # caster / manifest identity (§30.6.3). CPU layout + hash only — no
+                # CUDA query, no change to the cubemap or the rendered HDR.
+                if (shadow_ctx is not None
+                        and shadow_ctx.get('carry_receiver_identity')):
+                    from utils.light_utils import receiver_identity_meta
+                    _rqi = receiver_identity_meta(
+                        xyz,
+                        np.array(light.point_light_position.numpy(), dtype=np.float32),
+                        int(getattr(light, 'shadow_res', 512)),
+                        bias=float(getattr(light, 'shadow_bias', 0.02)),
+                        znear=float(getattr(light, 'shadow_znear', 0.01)))
+                    receiver_query_meta = dict(_rqi)
+                    receiver_query_meta['caster_sha256'] = shadow_ctx.get('caster_sha256')
+                    receiver_query_meta['implementation_manifest_sha256'] = shadow_ctx.get(
+                        'implementation_manifest_sha256')
+                    receiver_query_meta['shadow_ctx_build_count'] = shadow_ctx.get(
+                        'shadow_ctx_build_count', 1)
+            else:
+                shadow_cube, shadow_alpha = render_shadow_cubemap(
+                    xyz, opacity, scaling, rot,
+                    np.array(light.point_light_position.numpy(), dtype=np.float32),
+                    res=int(getattr(light, 'shadow_res', 512)),
+                    argmax_depth=(getattr(light, 'shadow_depth', 'do') == 'argmax'))
+        # N4 (§21) / N4-R0 (§25.4): per-emitter-sample shadow contexts (real
+        # penumbra). When the pre-built shadow_ctx carries a `samples` list, each
+        # entry is a STRUCTURED context {index, position, position_hash,
+        # transmit_cube, transmit_final, transmit_bounds, bounds_hash,
+        # shadow_meta}; the area-light branch queries the SAMPLE's cubemap and
+        # validates its position/index/bounds instead of the shared center.
+        emitter_transmit = None
+        if shadow_ctx is not None and 'samples' in shadow_ctx:
+            emitter_transmit = shadow_ctx['samples']
+        light_color, light_extras = light.lightRender(
+            xyz, normal_for_light, albedo, roughness, matallic, viewdirs,
+            shadow_cube=shadow_cube, shadow_alpha=shadow_alpha,
+            transmit_cube=transmit_cube, transmit_bounds=transmit_bounds,
+            transmit_final=transmit_final, emitter_transmit=emitter_transmit,
+            receiver_transmittance=receiver_transmittance)
+        # M2 (point-light diag): only keep the per-component split when requested;
+        # the raster colour path needs only light_color.
+        if not return_light_components:
+            del light_extras
 
         # Phase 39: save lightRender inputs for PBR MLP gradient computation
         # Phase 78: gated behind is_training — not needed for inference
         if is_training:
             pc._diag_data['xyz_light'] = xyz.numpy()
-            pc._diag_data['normal_t_light'] = normal_t.numpy()
+            pc._diag_data['normal_t_light'] = normal_for_light.numpy()
             pc._diag_data['albedo_light'] = albedo.numpy()
             pc._diag_data['roughness_light'] = roughness.numpy()
             _matallic_np = matallic.numpy() if (matallic is not None) else None
@@ -638,34 +890,77 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
             pc._diag_data['viewdirs_light'] = viewdirs.numpy()
             pc._diag_data['with_matallic'] = pc.with_matallic
             pc._diag_data['light_obj'] = light
+        # 2026-08-02: viewdirs/normal_for_light only used by lightRender (and the numpy
+        # copies above); release before building features. Inference path is
+        # free to reclaim; training already copied what it needs.
+        del viewdirs, normal_for_light
 
-        if is_training:
-            normal = normal @ viewpoint_camera.world_view_transform[:3, :3]
-        normal = normal * 0.5 + 0.5
+        if return_aux or is_training:
+            if is_training:
+                normal = normal @ viewpoint_camera.world_view_transform[:3, :3]
+            normal = normal * 0.5 + 0.5
 
-        if pc.with_matallic:
-            if pc.normal_detal:
-                features = jt.concat([normal,delta_normal_norm,albedo,roughness,matallic],dim=-1)             
+            if pc.with_matallic:
+                if pc.normal_detal:
+                    features = jt.concat([normal,delta_normal_norm,albedo,roughness,matallic],dim=-1)
+                else:
+                    features = jt.concat([normal,albedo,roughness,matallic],dim=-1)
             else:
-                features = jt.concat([normal,albedo,roughness,matallic],dim=-1)
+                if pc.normal_detal:
+                    features = jt.concat([normal,delta_normal_norm,albedo,roughness],dim=-1)
+                else:
+                    features = jt.concat([normal,albedo,roughness],dim=-1)
         else:
-            if pc.normal_detal:
-                features = jt.concat([normal,delta_normal_norm,albedo,roughness],dim=-1)             
-            else:
-                features = jt.concat([normal,albedo,roughness],dim=-1)              
+            features = None
 
         color = light_color
     else:
-        if is_training:
-            normal = normal @ viewpoint_camera.world_view_transform[:3, :3]
-        normal = normal * 0.5 + 0.5
+        if return_aux or is_training:
+            if is_training:
+                normal = normal @ viewpoint_camera.world_view_transform[:3, :3]
+            normal = normal * 0.5 + 0.5
 
-        if pc.normal_detal:
-            features = jt.concat([normal,delta_normal_norm],dim=-1)
+            if pc.normal_detal:
+                features = jt.concat([normal,delta_normal_norm],dim=-1)
+            else:
+                features = normal
         else:
-            features = normal
+            features = None
 
 
+    # Full-resolution relighting only needs RGB. Omitting extra_attrs avoids an
+    # 8-channel 5187x3361 auxiliary image (~532 MiB) and its retained package.
+    raster_extra_attrs = features if (return_aux or is_training) else None
+    # P0-b: pixel-space diffuse/specular split. In point-light diag mode, pack the
+    # per-Gaussian PL diffuse+specular as 6 extra channels so they rasterize with
+    # the exact same sort/opacity/alpha as the final RGB. P2 (REASSESSMENT §P2):
+    # when --diag-gaussians also pack the front-face mask as a 7th channel.
+    # Default path keeps extra_attrs=None (no extra res=1 memory).
+    # §27.2.4 (components-off lifecycle fix): an explicit collection gate evaluated
+    # HERE (before the probes) — when components are off, `light_extras` was already
+    # `del`-eted above and probing it would NameError; the raster path needs only
+    # RGB. `is_pbr` short-circuits first so the non-PBR branch never touches it.
+    # Semantics are unchanged on every existing path: `not is_training` in the gate
+    # matches the original `_has_*` guards, and the `del` above keeps its original
+    # `not return_light_components` condition (training path untouched).
+    _collect_pl_components = is_pbr and return_light_components and not is_training
+    _has_fm = (_collect_pl_components and getattr(light, 'diag_gaussians', False)
+               and 'front_mask' in light_extras)
+    # N4-R0 (§25.4 item 7): effective shadow visibility as a 1-channel pixel tail
+    # (penumbra line profile). ED-generic rasterizer, no CUDA change needed.
+    _has_veff = (_collect_pl_components and getattr(light, 'point_light_enabled', False)
+                 and 'veff' in light_extras)
+    _n_pl = 6 + (1 if _has_fm else 0) + (1 if _has_veff else 0)
+    if is_pbr and return_light_components and not is_training and getattr(light, 'point_light_enabled', False):
+        _pl_comp = jt.concat([light_extras["diffuse_rgb_pl"], light_extras["specular_rgb_pl"]], dim=-1)  # [G,6]
+        if _has_fm:
+            _pl_comp = jt.concat([_pl_comp, light_extras["front_mask"]], dim=-1)  # [G,7]
+        if _has_veff:
+            _pl_comp = jt.concat([_pl_comp, light_extras["veff"]], dim=-1)  # [G,8] or [G,7]
+        if features is not None:
+            raster_extra_attrs = jt.concat([features, _pl_comp], dim=-1)   # aux 在前, PL 尾在后
+        else:
+            raster_extra_attrs = _pl_comp
     n_contri,rendered_image, rendered_depth,rendered_opacity, rendered_norm,depth_normal, rendered_alpha, radii, rendered_features = rasterizer(
         means3D=xyz,
         means2D=screenspace_points,
@@ -675,12 +970,69 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
         scales=scaling,
         rotations=rot,
         cov3Ds_precomp=None,
-        extra_attrs=features
+        extra_attrs=raster_extra_attrs,
+        inference_only=(not is_training),  # M2 (P0): no tape / no scratch retention in inference
+        return_aux=return_aux
     )
-    # Store reference for manual backward (Phase 22)
-    import gaussian_renderer as _gr
-    _gr._last_rasterize_func = getattr(rasterizer, '_last_rasterize_func', None)
-    _gr._last_rasterizer = rasterizer
+    # Store reference for manual backward (Phase 22).
+    # M2 (P0): only the training path holds these global diagnostic refs — they keep
+    # the previous rasterizer (with its huge Geometry/Binning/Image buffers) alive,
+    # which caused memory to accumulate across inference views.
+    if is_training:
+        import gaussian_renderer as _gr
+        _gr._last_rasterize_func = getattr(rasterizer, '_last_rasterize_func', None)
+        _gr._last_rasterizer = rasterizer
+
+    # P0-b: split the PL channels off rendered_features. Early-return path
+    # (return_aux=False) gives exactly [n_pl,H,W]; aux path gives [aux+n_pl,H,W].
+    # P2: n_pl = 6 (diffuse+specular) or 7 (with front-face mask).
+    diffuse_pl_image = None
+    specular_pl_image = None
+    front_pl_image = None
+    veff_pl_image = None
+    if is_pbr and return_light_components and not is_training:
+        C = rendered_features.shape[0]
+        if C >= _n_pl:
+            if C > _n_pl:
+                rendered_features, _pl_tail = rendered_features.split([C - _n_pl, _n_pl], dim=0)
+            else:
+                _pl_tail = rendered_features
+            if _has_fm and _has_veff:
+                diffuse_pl_image, specular_pl_image, front_pl_image, veff_pl_image = \
+                    _pl_tail.split([3, 3, 1, 1], dim=0)
+            elif _has_fm:
+                diffuse_pl_image, specular_pl_image, front_pl_image = _pl_tail.split([3, 3, 1], dim=0)
+            elif _has_veff:
+                diffuse_pl_image, specular_pl_image, veff_pl_image = _pl_tail.split([3, 3, 1], dim=0)
+            else:
+                diffuse_pl_image, specular_pl_image = _pl_tail.split([3, 3], dim=0)
+
+    # §30.5.2 E2-C: the compact exact-query metadata must reach the pkg on EVERY
+    # return path (components on AND off — off tasks still write the receiver
+    # identity) and be consistent with THIS view's receiver cloud G.
+    if receiver_query_meta is not None:
+        assert receiver_query_meta['G'] == xyz.shape[0], \
+            f'exact receiver G {receiver_query_meta["G"]} != xyz G {xyz.shape[0]}'
+    _rq = {'receiver_query_meta': receiver_query_meta,
+           'receiver_query_diag': receiver_query_diag}
+
+    if not return_aux and not is_training:
+        if return_light_components and is_pbr:
+            return {
+                "render": rendered_image,
+                "diffuse_rgb": light_extras.get("diffuse_rgb", 0) + light_extras.get("diffuse_rgb_pl", 0),
+                "specular_rgb": light_extras.get("specular_rgb", 0) + light_extras.get("specular_rgb_pl", 0),
+                "diffuse_rgb_pl": light_extras.get("diffuse_rgb_pl", 0),
+                "specular_rgb_pl": light_extras.get("specular_rgb_pl", 0),
+                "diffuse_pl_image": diffuse_pl_image,     # [3,H,W] pixel-space PL diffuse
+                "specular_pl_image": specular_pl_image,   # [3,H,W] pixel-space PL specular
+                "front_pl_image": front_pl_image,         # [1,H,W] pixel-space front-face mask (diag)
+                "veff_pl_image": veff_pl_image,           # [1,H,W] pixel-space effective visibility (penumbra)
+                "alpha": rendered_alpha,                  # [1,H,W] accumulated alpha (for normalising front mask)
+                **_rq,
+            }
+        return {"render": rendered_image, **_rq}
+
     feature_dict = {}
 
     if is_pbr:
@@ -737,11 +1089,26 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
             "points":xyz,
             "points_normal":normal,
             "_diag_data": pc._diag_data if hasattr(pc, '_diag_data') else {},
+            **_rq,
             }
+        if return_light_components and is_pbr:
+            results["diffuse_rgb"] = light_extras.get("diffuse_rgb", 0) + light_extras.get("diffuse_rgb_pl", 0)
+            results["specular_rgb"] = light_extras.get("specular_rgb", 0) + light_extras.get("specular_rgb_pl", 0)
+            results["diffuse_rgb_pl"] = light_extras.get("diffuse_rgb_pl", 0)
+            results["specular_rgb_pl"] = light_extras.get("specular_rgb_pl", 0)
+            if diffuse_pl_image is not None:
+                results["diffuse_pl_image"] = diffuse_pl_image
+                results["specular_pl_image"] = specular_pl_image
+                results["front_pl_image"] = front_pl_image
+                results["veff_pl_image"] = veff_pl_image
         results.update(feature_dict)
+        # 2026-08-02: color/opacity/rot are not referenced by results (scaling,
+        # xyz, normal, neural_opacity are). Release them to cut ~400MiB before
+        # the caller processes the image. features is kept (rasterizer may hold it).
+        del color, opacity, rot
 
-        return results        
-        
+        return results
+
     else:
         return {"render": rendered_image,
             "viewspace_points": screenspace_points,
@@ -763,6 +1130,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
             "points":xyz,
             "points_normal":normal,
             "_diag_data": pc._diag_data if hasattr(pc, '_diag_data') else {},
+            **_rq,
 
             }
 

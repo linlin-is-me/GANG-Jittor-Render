@@ -3,13 +3,14 @@ Standalone renderer: load a GANG checkpoint and render all test views.
 
 Usage:
     python tools/render_views.py \
-        --npz outputs/treehill_p44_7k/chkpnt7000.npz \
-        --out_dir outputs/treehill_p44_7k/renders
+        --npz /path/to/item_sequence_checkpoint.npz \
+        --source_path /path/to/scene \
+        --resolution 4 \
+        --out_dir outputs/renders
 
 Output:
-    outputs/treehill_p44_7k/renders/
-        view_000.png   ...  view_017.png   (render)
-        view_000_gt.png ...  view_017_gt.png (ground truth)
+    outputs/renders/render/view_000.png    ...  (render)
+    outputs/renders/gt/view_000_gt.png     ...  (ground truth)
 """
 import sys, os, argparse
 import numpy as np
@@ -29,10 +30,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--npz', required=True, help='Checkpoint file (.npz)')
     parser.add_argument('--out_dir', required=True, help='Output directory for rendered images')
-    parser.add_argument('--source_path', default='data/treehill')
-    parser.add_argument('--resolution', type=int, default=8)
+    parser.add_argument('--source_path', required=True)
+    parser.add_argument('--resolution', type=int, required=True,
+                        help='resolution divisor used during training')
     parser.add_argument('--is_pbr', type=int, default=0)
-    parser.add_argument('--max_points', type=int, default=-1)
     parser.add_argument('--start_idx', type=int, default=0, help='First camera index to render')
     parser.add_argument('--end_idx', type=int, default=-1, help='Last camera index (exclusive, -1 = all)')
     args = parser.parse_args()
@@ -56,7 +57,7 @@ def main():
         add_opacity_dist=False, add_cov_dist=False, add_color_dist=False, add_level=False,
         visible_threshold=0.1, dist2level='round', base_layer=10, progressive=True,
         extend=1.1, is_pbr=is_pbr, normal_detal=False, with_meta=True,
-        bound=1.5, ratio=1, ds=1, undistorted=False, max_points=args.max_points,
+        bound=1.5, ratio=1, ds=1, undistorted=False, max_points=-1,
         dist_ratio=0.999, init_level=-1, levels=-1,
         white_background=False, random_background=False
     )
@@ -110,9 +111,8 @@ def main():
     g.anchor_demon = jt.zeros((N, 1))
 
     # Build scene (cameras only, skip octree rebuild)
-    # NOTE: model trained at a specific resolution; rendering at a different
-    # resolution requires proper LOD recalculation (Phase 34, pending).
-    # For now, render at training resolution (resolution=16) for correct output.
+    # Models are trained at a specific resolution divisor. Rendering at another
+    # divisor requires LOD recalculation, so --resolution must match training.
     s = Scene(lp, g, shuffle=False, resolution_scales=lp.resolution_scales, is_pbr=is_pbr,
               skip_octree=True)
     g.eval()  # Phase 78: set MLPs to eval mode

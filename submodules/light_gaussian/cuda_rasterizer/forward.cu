@@ -13,6 +13,7 @@
 #include "auxiliary.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cstdint>
 namespace cg = cooperative_groups;
 
 // Forward method for converting the input spherical harmonics
@@ -563,7 +564,10 @@ liteRenderCUDA(
 	float* __restrict__ out_color,
 	float* __restrict__ out_opacity,
 	float* __restrict__ out_depth,
-	bool argmax_depth)
+	bool argmax_depth,
+	int num_boundaries,
+	const float* __restrict__ boundaries,
+	float* __restrict__ out_transmit)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -599,6 +603,18 @@ liteRenderCUDA(
 	float max_weight = 0.0f;
 	float except_depth = 0.0f;
 
+	// P4 (P4.1 contract): per-pixel ray length (cube convention focal=W/2) so a
+	// Gaussian's view-z can be converted to ray distance and the prefix
+	// transmittance recorded at each ray-distance boundary.
+	// `num_boundaries` == length of `boundaries` == number of out_transmit maps.
+	float rl = 1.0f;
+	int b_ptr = 0;
+	if (num_boundaries > 0) {
+		float rdx = (pixf.x - W * 0.5f + 0.5f) / (W * 0.5f);
+		float rdy = (pixf.y - H * 0.5f + 0.5f) / (H * 0.5f);
+		rl = sqrtf(rdx * rdx + rdy * rdy + 1.0f);
+	}
+
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
@@ -632,6 +648,21 @@ liteRenderCUDA(
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 			if (power > 0.0f)
 				continue;
+
+			// P4 (P4.1 contract): record the prefix transmittance at every
+			// boundary this Gaussian reaches, using T BEFORE this Gaussian. So
+			// out_transmit[b] = transmittance strictly BEFORE ray-distance
+			// boundaries[b] (a Gaussian exactly at boundaries[b] is excluded =
+			// the receiver self-bias). The receiver later queries the two
+			// boundaries bracketing (dist - bias) and interpolates in optical
+			// depth. `final_T[pix_id]` carries the end-of-ray transmittance.
+			if (num_boundaries > 0) {
+				float g_ray = depth[collected_id[j]] * rl;
+				while (b_ptr < num_boundaries && boundaries[b_ptr] <= g_ray) {
+					out_transmit[b_ptr * H * W + pix_id] = T;
+					b_ptr++;
+				}
+			}
 
 			// Eq. (2) from 3D Gaussian splatting paper.
 			// Obtain alpha by multiplying with Gaussian opacity
@@ -685,6 +716,131 @@ liteRenderCUDA(
 			out_depth[pix_id] = 0.0f;
 		}
 		out_opacity[pix_id] = O;
+		// P4 (P4.1 contract): fill any boundaries beyond the deepest Gaussian
+		// with the final T. final_T is also written to its own output so the
+		// receiver query can use it past the last boundary.
+		if (num_boundaries > 0) {
+			while (b_ptr < num_boundaries) {
+				out_transmit[b_ptr * H * W + pix_id] = T;
+				b_ptr++;
+			}
+		}
+	}
+}
+
+
+
+// §28.6 E1 receiver-depth exact: per-pixel, multi-receiver prefix-transmittance
+// query. Iterates the pixel's casters EXACTLY as liteRenderCUDA does (power /
+// alpha<1/255 / min 0.99 / test_T<1e-4 early stop), but instead of rasterising
+// colour it answers every receiver at this pixel: q is sorted ascending and a
+// receiver's T is the prefix product over casters with g_ray < q (record-before;
+// a caster at g_ray == q is excluded). One call = one cubemap face; pixel_offsets
+// [res*res+1] and q_sorted [G_face] come from the §28.4 layout; out_transmit
+// [G_face] is the face's per-receiver T in sorted order. 64-bit offsets/ids stay
+// 64-bit (no silent 32-bit truncation; §28.4).
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+receiverQueryCUDA(
+	const int W, const int H,
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ depth,
+	const int64_t* __restrict__ pixel_offsets,
+	const float* __restrict__ q_sorted,
+	float* __restrict__ out_transmit)
+{
+	auto block = cg::this_thread_block();
+	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y, H) };
+	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	uint32_t pix_id = W * pix.y + pix.x;
+	float2 pixf = { (float)pix.x, (float)pix.y };
+
+	bool inside = pix.x < W && pix.y < H;
+	bool done = !inside;
+
+	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	int toDo = range.y - range.x;
+
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+
+	float T = 1.0f;
+	// per-pixel ray length (cube focal = W/2), identical to liteRenderCUDA.
+	float rdx = (pixf.x - W * 0.5f + 0.5f) / (W * 0.5f);
+	float rdy = (pixf.y - H * 0.5f + 0.5f) / (H * 0.5f);
+	float rl = sqrtf(rdx * rdx + rdy * rdy + 1.0f);
+
+	// this pixel's sorted receiver queries [q_ptr, q_end) — 64-bit offsets.
+	int64_t q_ptr = inside ? pixel_offsets[pix_id] : 0;
+	int64_t q_end = inside ? pixel_offsets[pix_id + 1] : 0;
+
+	// §29.2.2: a pixel with NO receiver queries has nothing to answer — skip the
+	// whole caster loop instead of traversing every Gaussian of its tile. This is
+	// purely a performance guard: the tail-fill below writes nothing when
+	// q_ptr==q_end, so every valid receiver's T is unchanged (power/alpha/early
+	// stop / record-before ordering untouched).
+	done = done || (q_ptr >= q_end);
+
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		int num_done = __syncthreads_count(done);
+		if (num_done == BLOCK_SIZE)
+			break;
+
+		int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			int coll_id = point_list[range.x + progress];
+			collected_id[block.thread_rank()] = coll_id;
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+		}
+		block.sync();
+
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+			float2 xy = collected_xy[j];
+			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			float4 con_o = collected_conic_opacity[j];
+			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+
+			// record-before: every receiver with q <= g_ray gets the CURRENT T
+			// (a caster exactly at g_ray == q is excluded — must NOT be accumulated
+			// before this write). Mirrors liteRenderCUDA's boundary recording.
+			float g_ray = depth[collected_id[j]] * rl;
+			while (q_ptr < q_end && q_sorted[q_ptr] <= g_ray) {
+				out_transmit[q_ptr] = T;
+				q_ptr++;
+			}
+
+			float alpha = min(0.99f, con_o.w * exp(power));
+			if (alpha < 1.0f / 255.0f)
+				continue;
+			float test_T = T * (1 - alpha);
+			if (test_T < 0.0001f)
+			{
+				done = true;
+				continue;
+			}
+			T = test_T;
+		}
+	}
+
+	// fill any remaining receivers at this pixel (incl. empty tiles / early stop)
+	// with the renderer's final T — same convention as liteRenderCUDA's tail fill.
+	if (inside) {
+		while (q_ptr < q_end) {
+			out_transmit[q_ptr] = T;
+			q_ptr++;
+		}
 	}
 }
 
@@ -919,7 +1075,10 @@ void FORWARD::lite_render(
 	float* out_color,
 	float* out_opacity,
 	float* out_depth,
-	bool argmax_depth)
+	bool argmax_depth,
+	int num_boundaries,
+	const float* boundaries,
+	float* out_transmit)
 {
 	liteRenderCUDA<NUM_CHANNELS><<<grid, block>>>(
 		W, H,
@@ -935,9 +1094,38 @@ void FORWARD::lite_render(
 		out_color,
 		out_opacity,
 		out_depth,
-		argmax_depth);
+		argmax_depth,
+		num_boundaries,
+		boundaries,
+		out_transmit);
 }
 
+
+
+// §28.6 E1: launch the per-pixel multi-receiver prefix query for one cubemap face.
+void FORWARD::receiver_query(
+	const dim3 grid, dim3 block,
+	int W, int H,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	const float2* points_xy_image,
+	const float4* conic_opacity,
+	const float* depth,
+	const int64_t* pixel_offsets,
+	const float* q_sorted,
+	float* out_transmit)
+{
+	receiverQueryCUDA<<<grid, block>>>(
+		W, H,
+		ranges,
+		point_list,
+		points_xy_image,
+		conic_opacity,
+		depth,
+		pixel_offsets,
+		q_sorted,
+		out_transmit);
+}
 
 
 

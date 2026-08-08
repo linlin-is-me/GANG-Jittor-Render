@@ -14,6 +14,13 @@ from jittor import nn  # TODO: verify each import is valid in Jittor
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix,fov2focal
 
+
+def _camera_center_from_world_view(world_view_transform):
+    """Invert a rigid world-to-view transform without jt.linalg.inv/CuPy."""
+    rotation_t = world_view_transform[:3, :3]
+    translation = world_view_transform[3, :3]
+    return -(translation.unsqueeze(0) @ rotation_t.transpose(0, 1)).squeeze(0)
+
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image,normal,albedo,roughness,
                   metal,irradiance, gt_alpha_mask,
@@ -80,7 +87,7 @@ class Camera(nn.Module):
         self.world_view_transform = jt.array(getWorld2View2(R, T, trans, scale)).transpose(0, 1)
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1)
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0) @ self.projection_matrix.unsqueeze(0)).squeeze(0)
-        self.camera_center = jt.linalg.inv(self.world_view_transform)[3, :3]
+        self.camera_center = _camera_center_from_world_view(self.world_view_transform)
         
     def get_calib_matrix_nerf(self):
         focal = fov2focal(self.FoVx, self.image_width)  # original focal length
@@ -99,6 +106,5 @@ class MiniCam:
         self.zfar = zfar
         self.world_view_transform = world_view_transform
         self.full_proj_transform = full_proj_transform
-        view_inv = jt.linalg.inv(self.world_view_transform)
-        self.camera_center = view_inv[3][:3]
+        self.camera_center = _camera_center_from_world_view(self.world_view_transform)
 

@@ -7,3 +7,5 @@ pillow
 tqdm
 scipy
 scikit-learn
+colorama
+matplotlib

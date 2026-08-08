@@ -226,7 +226,11 @@ def normal_from_depth_image(depth, intrinsic_matrix, extrinsic_matrix):
 
 def get_minimum_axis(scales, rotations):
     R = build_rotation(rotations)
-    smallest_axis_idx = scales.argmin(dim=-1)[1][..., None, None].expand(-1, 3, -1)
+    # Jittor returns (indices, values), unlike torch.min(...), which returns
+    # (values, indices).  Using element 1 here silently converted the minimum
+    # scale value (normally < 1) into gather index 0, so almost every Gaussian
+    # used rotation axis 0 as its lighting normal.
+    smallest_axis_idx = scales.argmin(dim=-1)[0][..., None, None].expand(-1, 3, -1)
     smallest_axis = R.gather(2, smallest_axis_idx)
     return smallest_axis.squeeze(dim=2)
 

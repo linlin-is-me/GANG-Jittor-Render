@@ -2,10 +2,10 @@
 Evaluate PSNR/SSIM of a trained model on test views.
 
 Usage:
-    python tools/eval_psnr.py --model_path outputs/treehill_10k_m30 --iteration 10000
-    python tools/eval_psnr.py --model_path outputs/treehill_planD_full --ply_only
+    python tools/eval_psnr.py --model_path /path/to/model_directory \
+        --source_path /path/to/scene --iteration 10000 --is_pbr 0
 """
-import sys, os, time, argparse
+import sys, os, time, argparse, re
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'submodules'))
@@ -25,13 +25,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', required=True)
     parser.add_argument('--iteration', type=int, default=-1, help='Checkpoint iteration (default: latest)')
-    parser.add_argument('--source_path', default='data/treehill')
-    parser.add_argument('--resolution', type=int, default=-1)
-    parser.add_argument('--is_pbr', type=int, default=0)
+    parser.add_argument('--source_path', required=True)
+    parser.add_argument('--resolution', type=int, required=True,
+                        help='resolution divisor used during training')
+    parser.add_argument('--is_pbr', type=int, choices=(0,), default=0,
+                        help='only non-PBR evaluation is supported')
     parser.add_argument('--save_images', type=int, default=1, help='Save rendered images')
     args = parser.parse_args()
 
-    is_pbr = bool(args.is_pbr)
+    is_pbr = False
     model_path = args.model_path
     os.makedirs(os.path.join(model_path, 'eval'), exist_ok=True)
 
@@ -41,11 +43,14 @@ def main():
     else:
         # Find latest checkpoint
         import glob
-        ckpts = sorted(glob.glob(os.path.join(model_path, "chkpnt*.npz")))
+        ckpts = glob.glob(os.path.join(model_path, "chkpnt*.npz"))
         if not ckpts:
             print("No checkpoint found. Trying PLY...")
             ckpts = []
-        npz_path = ckpts[-1] if ckpts else None
+        def checkpoint_iteration(path):
+            match = re.fullmatch(r'chkpnt(\d+)\.npz', os.path.basename(path))
+            return int(match.group(1)) if match else -1
+        npz_path = max(ckpts, key=checkpoint_iteration) if ckpts else None
 
     # Build model params
     lp = Namespace(
@@ -99,18 +104,10 @@ def main():
 
     # Setup lightweight optimizer (needed for model internals, not for training)
     K = g.n_offsets
-    _setup_optimizer(g, is_pbr)
+    _setup_optimizer(g)
     g.eval()  # Phase 78: set MLPs to eval mode (avoids per-frame coarse_intervals AttributeError)
     test_cams = s.getTestCameras()
     print(f"Test cameras: {len(test_cams)}")
-
-    # Setup cubemap for PBR
-    light = None
-    if is_pbr:
-        from scene.NVDIFFREC.light import Hybridlight
-        light = Hybridlight(dir=os.path.join(args.source_path))
-        light.build_mips()
-        print("  PBR cubemap built")
 
     pipe = Namespace(compute_cov3D_python=False, debug=False, sample_num=64)
     bg = jt.float32([0, 0, 0])
@@ -124,7 +121,7 @@ def main():
         except: pass
         voxel_mask = prefilter_voxel(cam, g, pipe, bg)
         render_pkg = render(cam, g, pipe, bg, visible_mask=voxel_mask,
-                            is_pbr=is_pbr, light=light, is_training=False)
+                            is_pbr=False, light=None, is_training=False)
 
         image = render_pkg["render"].float32()
         gt = cam.original_image.float32()
@@ -165,7 +162,7 @@ def main():
         f.write(f"Per-view SSIM: {ssim_list}\n")
 
 
-def _setup_optimizer(g, is_pbr):
+def _setup_optimizer(g):
     """Lightweight optimizer for model internals (not training)."""
     K = g.n_offsets
     l = [
@@ -179,12 +176,6 @@ def _setup_optimizer(g, is_pbr):
         {"params": g.mlp_cov.parameters(), "lr": 0.004, "name": "mlp_cov"},
         {"params": g.mlp_color.parameters(), "lr": 0.008, "name": "mlp_color"},
     ]
-    if is_pbr:
-        l.extend([
-            {"params": g.mlp_albedo.parameters(), "lr": 0.075, "name": "mlp_albedo"},
-            {"params": g.mlp_roughness.parameters(), "lr": 0.005, "name": "mlp_roughness"},
-            {"params": g.mlp_matallic.parameters(), "lr": 0.005, "name": "mlp_matallic"},
-        ])
     g.optimizer = Namespace(param_groups=l)
     g.optimizer.state_dict = lambda: {}
     g.optimizer.load_state_dict = lambda d: None

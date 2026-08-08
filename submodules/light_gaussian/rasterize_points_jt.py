@@ -1,11 +1,16 @@
 # JGaussian-aligned: cuda_header with #include + direct CudaRasterizer::Rasterizer::* calls.
 # forward_0/forward_1 split for exact buffer sizing (aligned with JGaussian Phase 2.4a).
+import hashlib
 import os
 import numpy as np
 import jittor as jt
 
 # Phase 22: Global cache for CUDA backward gradients (bypass Jittor autograd crash)
 GRAD_CACHE = {}
+
+# M1 (P0.2): OOB diagnostics gate; set RASTER_DIAG=1 to report buffer sizes +
+# radii statistics (gated, no change to numeric results).
+_DIAG_BUFFER = os.environ.get('RASTER_DIAG') == '1'
 
 _base = os.path.dirname(os.path.abspath(__file__))
 _header = os.path.join(_base, 'cuda_rasterizer')
@@ -17,24 +22,48 @@ _lib = os.path.join(_base, 'build')
 # Workaround: symlink/copy to /tmp/ (no spaces) and use those paths.
 if ' ' in _base:
     import shutil
-    _safe_root = '/tmp/jt_rasterizer'
+
+    # Isolate the compiler workaround per checkout. A shared fixed directory can
+    # mix headers and binaries from different clones in the same WSL instance.
+    _repo_key = hashlib.sha256(os.path.realpath(_base).encode('utf-8')).hexdigest()[:12]
+    _safe_root = os.path.join('/tmp', f'jt_rasterizer_{_repo_key}')
     os.makedirs(_safe_root, exist_ok=True)
-    # Copy librasterizer.so
+
+    def _replace_symlink(source, link_path):
+        source = os.path.realpath(source)
+        if os.path.islink(link_path) and os.path.realpath(link_path) == source:
+            return
+        if os.path.lexists(link_path):
+            if os.path.isdir(link_path) and not os.path.islink(link_path):
+                shutil.rmtree(link_path)
+            else:
+                os.unlink(link_path)
+        os.makedirs(os.path.dirname(link_path), exist_ok=True)
+        temp_link = f'{link_path}.tmp-{os.getpid()}'
+        if os.path.lexists(temp_link):
+            os.unlink(temp_link)
+        os.symlink(source, temp_link)
+        os.replace(temp_link, link_path)
+
+    # Copy the shared library atomically so concurrent imports never observe a
+    # partially written file.
     _safe_lib = os.path.join(_safe_root, 'build')
     os.makedirs(_safe_lib, exist_ok=True)
     _safe_so = os.path.join(_safe_lib, 'librasterizer.so')
     _src_so = os.path.join(_lib, 'librasterizer.so')
     if os.path.exists(_src_so):
-        shutil.copy2(_src_so, _safe_so)
-    # Symlink cuda_rasterizer headers
+        _temp_so = f'{_safe_so}.tmp-{os.getpid()}'
+        shutil.copy2(_src_so, _temp_so)
+        os.replace(_temp_so, _safe_so)
+    elif os.path.lexists(_safe_so):
+        # Do not silently reuse a binary left by an earlier checkout at the
+        # same absolute path. A clean clone must first follow the build step.
+        os.unlink(_safe_so)
+
     _safe_header = os.path.join(_safe_root, 'cuda_rasterizer')
-    if not os.path.exists(_safe_header):
-        os.symlink(_header, _safe_header)
-    # Symlink glm headers
+    _replace_symlink(_header, _safe_header)
     _safe_glm = os.path.join(_safe_root, 'third_party/glm')
-    if not os.path.exists(_safe_glm):
-        os.makedirs(os.path.dirname(_safe_glm), exist_ok=True)
-        os.symlink(_glm, _safe_glm)
+    _replace_symlink(_glm, _safe_glm)
     _lib = _safe_lib
     _header = _safe_header
     _glm = _safe_glm
@@ -226,20 +255,40 @@ def depthToNormal(depth_map, viewmatrix, focal_x, focal_y):
 
 # ---------------------------------------------------------------------------
 def compute_buffer_size(means3D, image_width, image_height):
-    """Compute exact buffer sizes using CudaRasterizer::required<T>() templates.
-
-    Phase 50: Use precise required<T>() values to match PyTorch GANG exactly.
-    ImageState = N*4 (n_contrib) + N*4 (accum_alpha) + N*8 (ranges) + 128 = N*16+128
-    GeometryState = required<GeometryState>(P) varies by CUDA version; use generous estimate.
-    """
+    """ImageState size — exact formula matching required<ImageState>(N) in rasterizer_impl.h.
+    (GeometryState now comes from query_state_size(); see guide P0.1.)"""
     P = int(means3D.shape[0])
     W = int(image_width); H = int(image_height)
     N = W * H
-    # ImageState: exact formula matching required<ImageState>(N) in rasterizer_impl.h
     img = N * 16 + 128
-    # GeometryState: generous, avoids cub::DeviceScan overflow
-    geom = max(P * 128 + 32 * 1024 * 1024, 32 * 1024 * 1024)
-    return geom, img
+    return img
+
+
+def query_state_size(state_name, count):
+    """Query the exact CudaRasterizer::required<T>(count) byte size via jt.code (JIT).
+
+    Guide P0.1: GeometryState must be exact BEFORE forward_0; ImageState/BinningState
+    use the same header-only templates. Returns the exact byte count required by
+    CudaRasterizer::fromChunk — no Python heuristics, no cap, no fallback.
+    """
+    out = jt.array(jt.zeros([1], dtype=jt.int64))
+    dummy = jt.array(jt.zeros([1], dtype='int32'))
+    with jt.flag_scope(compile_options=proj_options):
+        (out,) = jt.code(
+            outputs=[out],
+            inputs=[dummy],
+            data={'CNT': int(count)},
+            cuda_header=cuda_header,
+            cuda_src=f'''
+@alias(out, out0) @alias(dummy, in0)
+size_t sz = CudaRasterizer::required<CudaRasterizer::{state_name}>(data["CNT"]);
+cudaMemcpy(out_p, &sz, sizeof(size_t), cudaMemcpyHostToDevice);
+''')
+        out.compile_options = proj_options
+    sz = int(out.data[0])
+    if sz <= 0:
+        raise RuntimeError(f"[rasterizer] invalid {state_name} size={sz} for count={count}")
+    return sz
 
 
 # ---------------------------------------------------------------------------
@@ -262,15 +311,19 @@ def RasterizeGaussiansCUDA(
     pre_bool = prefiltered
     dbg_bool = debug
 
-    geom_size, img_size = compute_buffer_size(means3D, W, H)
-    # bin_size_val comes from forward_0 (required<BinningState>(num_rendered))
+    # M1 (P0.1): exact GeometryState byte size BEFORE forward_0 (header template),
+    # plus exact ImageState size. bin_size (BinningState) comes from forward_0 itself.
+    # (The root-cause offset-gather fix in gaussian_renderer resolved the multi-view
+    # corruption; the exact sizes are verified correct.)
+    geom_size = query_state_size('GeometryState', P)
+    img_size = compute_buffer_size(means3D, W, H)
 
     with jt.flag_scope(compile_options=proj_options):
         # === Phase 1: forward_0 (preprocess + count) ===
-        # Use jt.code float32 output tensors for scalar return values.
-        # (The old host_buf volatile pointer hack is unreliable on non-unified-memory GPUs.)
+        # M1 (P0.1): bs_out is int64 — C++ bin_size is size_t (64-bit); int32 read
+        # truncated the value (silently under-allocated binningBuffer >1GiB).
         nr_out = jt.array(jt.zeros([1], dtype=jt.int32))
-        bs_out = jt.array(jt.zeros([1], dtype=jt.int32))
+        bs_out = jt.array(jt.zeros([1], dtype=jt.int64))
         geomBuffer = jt.array(jt.zeros([geom_size], dtype='uint8'))
         radii = jt.array(jt.zeros([P], dtype='int32'))
 
@@ -314,27 +367,56 @@ if (P != 0) {{
     bin_size = CudaRasterizer::required<CudaRasterizer::BinningState>(num_rendered);
 	}}
 // Phase 36: cudaMemcpy macro is #undef'd in cuda_header — safe to use raw function name.
+// M1 (P0.1): bs_out is int64 and bin_size is size_t — copy all 8 bytes, not 4.
 cudaMemcpy(nr_out_p, &num_rendered, sizeof(int), cudaMemcpyHostToDevice);
-cudaMemcpy(bs_out_p, &bin_size, sizeof(int), cudaMemcpyHostToDevice);
+cudaMemcpy(bs_out_p, &bin_size, sizeof(size_t), cudaMemcpyHostToDevice);
 ''')
         for o in [nr_out, bs_out, radii]:
             o.compile_options = proj_options
 
-        # Read scalar outputs: try var.data first, fall back to heuristic
-        try:
-            num_rendered_val = max(int(nr_out.data[0]), 1)
-            bin_size_val = max(int(bs_out.data[0]), 1)
-        except:
-            num_rendered_val = P
-            bin_size_val = geom_size  # use geom_size as bin_size estimate
-        # Phase 62: num_rendered is total (tile,gaussian) pairs — CAN exceed P
-        # at high resolutions. Removing the erroneous `num_rendered_val > P` clamp.
-        if bin_size_val <= 0 or bin_size_val > (1 << 30):  # 1GB sanity cap
-            bin_size_val = geom_size
+        # M1 (P0.1): read the exact 64-bit values. No try/except fallback, no 1GiB
+        # cap, no heuristic — a kernel/read failure propagates loudly (guide §4).
+        # num_rendered is total (tile,gaussian) pairs — CAN exceed P.
+        num_rendered_val = int(nr_out.data[0])
+        bin_size_val = int(bs_out.data[0])
+        if num_rendered_val < 0 or num_rendered_val > (1 << 31) - 1:
+            raise RuntimeError(
+                f"[rasterizer] invalid num_rendered={num_rendered_val} (P={P}, "
+                f"W={W}, H={H}). Count must be in [0, INT_MAX].")
+        if bin_size_val <= 0 or bin_size_val > (1 << 63) - 1:
+            raise RuntimeError(
+                f"[rasterizer] invalid BinningState size={bin_size_val} bytes "
+                f"(P={P}, num_rendered={num_rendered_val}). Must be positive and fit in int64.")
+
+        # M1 (P0.2): OOB diagnostics (RASTER_DIAG=1). Reports exact sizes + radii
+        # stats so out-of-bounds is attributable before PNG save, not after.
+        if _DIAG_BUFFER:
+            try:
+                r_np = radii.numpy()
+                r_sorted = np.sort(r_np)
+                pct = lambda q: float(np.percentile(r_sorted, q))
+                print(f"[rasterizer] P={P} num_rendered={num_rendered_val} "
+                      f"geom={geom_size}B img={img_size}B bin={bin_size_val}B | "
+                      f"radii med={pct(50):.0f} p90={pct(90):.0f} p99={pct(99):.0f} "
+                      f"p99.9={pct(99.9):.0f} max={int(r_np.max())} "
+                      f"tiles_max={(int(r_np.max()) * 2 // 16 + 2) ** 2}")
+            except Exception as de:
+                print(f"[rasterizer] radii diag failed: {de}")
 
         # === Phase 2: forward_1 (sort + render) ===
-        binningBuffer = jt.array(jt.zeros([bin_size_val], dtype='uint8'))
-        imgBuffer = jt.array(jt.zeros([img_size], dtype='uint8'))
+        # M1 (P0.1): binningBuffer at the EXACT required<BinningState> bytes.
+        # max(1) only guards the array allocation; forward_1 still receives the
+        # true num_rendered count via data['NR']. Allocation failure is reported
+        # with exact sizes — never silently continue with a smaller buffer.
+        try:
+            binningBuffer = jt.array(jt.zeros([max(bin_size_val, 1)], dtype='uint8'))
+            imgBuffer = jt.array(jt.zeros([img_size], dtype='uint8'))
+        except Exception as e:
+            raise RuntimeError(
+                f"[rasterizer] failed to allocate rasterizer buffers: "
+                f"binningBuffer={max(bin_size_val, 1)} bytes, imgBuffer={img_size} bytes "
+                f"(P={P}, num_rendered={num_rendered_val}). "
+                f"Check available GPU memory. Original error: {e}")
         out_color = jt.array(jt.zeros([3, H, W]))
         out_depth = jt.array(jt.zeros([1, H, W]))
         out_opacity = jt.array(jt.zeros([1, H, W]))
@@ -497,6 +579,13 @@ def RasterizeGaussiansFilterCUDA(
     M = 0
     pre = 1 if prefiltered else 0
     dbg = 1 if debug else 0
+    # M3 (blocked by precompiled .so): the guide's "allocate only exact GeometryState
+    # + radii" and dummy/small binning+image buffers reliably crash with
+    # cudaErrorIllegalAddress on a clean GPU — the precompiled libCudaRasterizer.so
+    # (Jul 20) DOES write past small binning/image buffers, contradicting the current
+    # C++ source analysis. Proper M3 needs the visible_filter signature cleanup +
+    # .so rebuild (risky on sm_89; main-project note: rebuilds give all-zero output).
+    # Python side stays at the original generous sizes which are verified working.
     gsz = P * 256 + 65536
     bsz = P * 128 + 65536
     isz = H * W * 32 + 4096

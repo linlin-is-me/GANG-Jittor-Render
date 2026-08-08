@@ -93,26 +93,39 @@ def _texture_cube(tex, uv, filter_mode):
 
     result = jt.zeros((N, C), dtype=tex.dtype)
 
+    # P4.5.B (fix): MUTUALLY-EXCLUSIVE dominant-axis face selection. The previous
+    # six `>=` masks all fired on cube edges/corners (e.g. (0,±.707,∓.707)) and
+    # summed 2-3 faces -> up to ~3x brightness (transmit probes showed T>1).
+    # Priority on equal |component|: X > Y > Z (same order as nvdiffrast's
+    # if-else chain), so every direction maps to EXACTLY ONE face.
+    adx, ady, adz = jt.abs(dx), jt.abs(dy), jt.abs(dz)
+    x_dom = jt.logical_and(adx >= ady, adx >= adz)
+    y_dom = jt.logical_and(jt.logical_not(x_dom), ady >= adz)
+    z_dom = jt.logical_and(jt.logical_not(x_dom), jt.logical_not(y_dom))
+    face_masks = [
+        jt.logical_and(x_dom, dx >= 0),   # +X
+        jt.logical_and(x_dom, dx < 0),    # -X
+        jt.logical_and(y_dom, dy >= 0),   # +Y
+        jt.logical_and(y_dom, dy < 0),    # -Y
+        jt.logical_and(z_dom, dz >= 0),   # +Z
+        jt.logical_and(z_dom, dz < 0),    # -Z
+    ]
+
     for s in range(6):
         # Project to face UV (same as _cubemap_sample_jt in util.py)
         if s == 0:   # +X
             u, v = -dz / (dx + 1e-10), -dy / (dx + 1e-10)
-            in_face = (dx >= jt.abs(dy)) & (dx >= jt.abs(dz))
         elif s == 1: # -X
             u, v = dz / (-dx + 1e-10), -dy / (-dx + 1e-10)
-            in_face = (-dx >= jt.abs(dy)) & (-dx >= jt.abs(dz))
         elif s == 2: # +Y
             u, v = dx / (dy + 1e-10), dz / (dy + 1e-10)
-            in_face = (dy >= jt.abs(dx)) & (dy >= jt.abs(dz))
         elif s == 3: # -Y
             u, v = dx / (-dy + 1e-10), -dz / (-dy + 1e-10)
-            in_face = (-dy >= jt.abs(dx)) & (-dy >= jt.abs(dz))
         elif s == 4: # +Z
             u, v = dx / (dz + 1e-10), -dy / (dz + 1e-10)
-            in_face = (dz >= jt.abs(dx)) & (dz >= jt.abs(dy))
         else:        # -Z
             u, v = -dx / (-dz + 1e-10), -dy / (-dz + 1e-10)
-            in_face = (-dz >= jt.abs(dx)) & (-dz >= jt.abs(dy))
+        in_face = face_masks[s]
 
         # UV [-1,1] → [0,1] → grid [-1,1]
         uv_01 = jt.stack([u * 0.5 + 0.5, v * 0.5 + 0.5], dim=-1)

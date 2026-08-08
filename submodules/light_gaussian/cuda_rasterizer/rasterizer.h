@@ -14,6 +14,7 @@
 
 #include <vector>
 #include <functional>
+#include <cstdint>
 
 namespace CudaRasterizer
 {
@@ -186,7 +187,36 @@ namespace CudaRasterizer
         float* out_color,
         float* out_opacity,
         float* out_depth,
-        int* radii = nullptr);
+        int* radii = nullptr,
+        const int num_boundaries = 0,
+        const float* boundaries = nullptr,
+        float* out_transmit = nullptr,
+        float* out_final = nullptr);
+
+    // §28.6 E1: inference-only receiver-exact forward — same preprocess/binning/
+    // sort/ranges as lite_forward, then answers one face's per-receiver queries.
+    // Old `lite_forward` ABI above is UNCHANGED (name/order/defaults).
+    static int receiver_forward(
+        std::function<char* (size_t)> geometryBuffer,
+        std::function<char* (size_t)> binningBuffer,
+        std::function<char* (size_t)> imageBuffer,
+        const int P, int D, int M,
+        const int width, int height,
+        const float* means3D,
+        const float* colors_precomp,
+        const float* opacities,
+        const float* scales,
+        const float scale_modifier,
+        const float* rotations,
+        const float* cov3D_precomp,
+        const float* viewmatrix,
+        const float* projmatrix,
+        const float* cam_pos,
+        const float tan_fovx, float tan_fovy,
+        const bool prefiltered,
+        const int64_t* pixel_offsets,
+        const float* q_sorted,
+        float* out_transmit);
 
     static void depthToNormal(
       const int width, const int height,

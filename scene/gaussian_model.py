@@ -164,7 +164,10 @@ class GaussianModel:
         # SDF
         # self.SDF = SDF(in_channels=3, geom_feat_size_out=32, nr_iters_for_c2f=10000*1.0)
         # self.dpsr = DPSR(res=(grid_resolution,grid_resolution,grid_resolution),sig=2)
-        self.dpsr = DPSR(res=(256,256,256),sig=2)
+        # M6 (P2): DPSR (256^3, G+omega ~129MiB) is never used in the render pipeline
+        # — create lazily via a class-level property (self._dpsr is None here; see
+        # the `dpsr` property defined after __init__). Saves ~129MiB per instance.
+        self._dpsr = None
 
         # Octree
         self.sub_pos_offsets = jt.array([[i % fork, (i // fork) % fork, i // (fork * fork)] for i in range(fork**3)]).float()
@@ -268,6 +271,15 @@ class GaussianModel:
                 nn.Linear(self.feat_dim, 3*self.n_offsets),
                 nn.Sigmoid()
             )
+
+    @property
+    def dpsr(self):
+        """M6 (P2): Lazy DPSR — the 256^3 DPSR (G+omega ~129MiB) is never used in the
+        render pipeline. Created on first access only; render-only inference never
+        materializes it (self._dpsr stays None, saving ~129MiB per instance)."""
+        if self._dpsr is None:
+            self._dpsr = DPSR(res=(256, 256, 256), sig=2)
+        return self._dpsr
 
     def eval(self):
         self.mlp_opacity.eval()
@@ -438,11 +450,15 @@ class GaussianModel:
 
         return result
 
-    def restore_numpy(self, np_data):
+    def restore_numpy(self, np_data, metadata=None):
         """Restore from numpy-captured state. Rebuilds optimizer (JGaussian pattern).
 
-        Phase 64: Returns (model_restored, light_state) tuple. light_state is None
-        for non-PBR checkpoints, or a dict with 'base','lgtSGs','specular_reflectance','roughness'.
+        Returns light_state. It is None for non-PBR checkpoints, or a dict with
+        'base', 'lgtSGs', 'specular_reflectance' and 'roughness'.
+
+        Named inference checkpoints may pass octree metadata separately.  Install
+        it before restore() so its fallback reconstruction cannot replace exact
+        values such as standard_dist with an anchor-order-dependent estimate.
         """
         light_state = None
         # Phase 64: detect light state appended at end of np_data list
@@ -484,11 +500,36 @@ class GaussianModel:
                 return obj
             return None
 
+        def _meta_scalar(value):
+            if isinstance(value, np.ndarray) and value.shape == ():
+                return value.item()
+            if isinstance(value, np.generic):
+                return value.item()
+            return value
+
+        if metadata:
+            for key in ('standard_dist', 'voxel_size'):
+                if key in metadata and metadata[key] is not None:
+                    setattr(self, key, float(_meta_scalar(metadata[key])))
+            for key in ('levels', 'init_level'):
+                if key in metadata and metadata[key] is not None:
+                    setattr(self, key, int(_meta_scalar(metadata[key])))
+
         model_args = _to_jt(np_data)
         # restore() extracts training_args_dict from model_args[-1],
         # reconstructs Namespace, calls training_setup(training_args)
         # which creates a fresh optimizer with correct param references.
         self.restore(model_args, None)
+
+        if metadata and metadata.get('_extra_level') is not None:
+            extra_level = np.asarray(metadata['_extra_level'], dtype=np.float32).reshape(-1)
+            if extra_level.shape[0] != self._anchor.shape[0]:
+                raise ValueError(
+                    f"_extra_level length {extra_level.shape[0]} does not match "
+                    f"anchor count {self._anchor.shape[0]}")
+            self._extra_level_np = extra_level
+            self._extra_level = jt.array(extra_level, dtype=jt.float32)
+
         print("[checkpoint] Restored from numpy checkpoint (optimizer rebuilt)")
         return light_state
 
@@ -751,6 +792,11 @@ class GaussianModel:
                 dist_min = jt_quantile(dist, 1.0 - dist_ratio)
                 all_dist_list.append(dist_min * scale)
                 all_dist_list.append(dist_max * scale)
+                # 2026-08-06: flush the lazy graph per camera — otherwise all C
+                # cameras' [N] dist Vars + quantile sorts accumulate before one
+                # materialization and OOM on 8GB (0-iter octree build on garden).
+                # Init path only; irrelevant to render/relight hot paths.
+                jt.sync_all(True); jt.gc()
 
         self.cam_infos = jt.array(np.array(cam_infos_list, dtype=np.float32))
 
@@ -805,7 +851,13 @@ class GaussianModel:
         print(f"Building octree time: {int(time_diff // 60)} min {time_diff % 60} sec")
 
     def create_from_pcd(self, points, spatial_lr_scale, logger=None):
-        from gaussian_renderer.simple_knn_jt import distCUDA2  # lazy to avoid circular import from gaussian_renderer/__init__.py
+        # 2026-08-06: the CUDA KNN (simple_knn_jt) does not exist in this repo
+        # copy; the scipy KDTree path below is the primary initializer (Phase 51).
+        # Guard the import so create_from_pcd still runs when it is absent.
+        try:
+            from gaussian_renderer.simple_knn_jt import distCUDA2  # noqa: F401 — fallback only
+        except ImportError:
+            distCUDA2 = None
         self.spatial_lr_scale = spatial_lr_scale
         # points is numpy array (jt.array doesn't fully copy large arrays to GPU)
         pts_np = points if isinstance(points, np.ndarray) else points.numpy()
@@ -852,6 +904,12 @@ class GaussianModel:
         # Compute KNN distances in numpy FIRST (avoids CUDA-only chain: distCUDA2 is jt.code, no CPU version)
         try:
             from scipy.spatial import KDTree
+            # 2026-08-06: this repo copy does not set _anchor_np inside weed_out;
+            # derive the numpy anchor grid from self.positions directly (Phase 51
+            # scipy-KDTree initializer) and stash it for the numpy shadow path.
+            anchor_np = (self.positions.numpy() if hasattr(self.positions, 'numpy')
+                         else np.asarray(self.positions))
+            self._anchor_np = np.ascontiguousarray(anchor_np, dtype=np.float32)
             tree = KDTree(self._anchor_np)
             dists, _ = tree.query(self._anchor_np, k=4)
             # KDTree returns actual Euclidean distances.
@@ -941,34 +999,71 @@ class GaussianModel:
         dist = jt.norm(ap[:, None, :] - ccs[None, :, :], dim=2)  # [N, C]
         dist = dist * scs.squeeze(1)[None, :] + 1e-10              # [N, C]
         pred_level = jt.log2(self.standard_dist / dist) / math.log2(self.fork)  # [N, C]
-        int_level = jt.floor(pred_level).int32().clamp(0, self.levels - 1)      # [N, C]
+        int_level = self.map_to_int_level(pred_level, self.levels - 1)          # [N, C]
         visible_count = (al[:, None] <= int_level).float32().mean(dim=1)         # [N]
         weed_mask = visible_count > self.visible_threshold                       # [N] bool
         mean_visible = float(visible_count.mean().numpy())
         return anchor_positions[weed_mask], anchor_levels[weed_mask], mean_visible, weed_mask
 
-    def set_anchor_mask(self, cam_center, iteration, resolution_scale,is_training = False):
-        # Pure Jittor computation on GPU — no numpy shadows needed
+    def compute_anchor_lod_state(self, cam_center, resolution_scale, coarse_index=None):
+        """N2.5-B (§21 / §24 step 3): PURE LOD computation — no model side effects.
+
+        Returns (anchor_mask, prog_ratio, transition_mask) for the given camera
+        centre / resolution scale / coarse_index. `prog_ratio`/`transition_mask`
+        are None when `dist2level != 'progressive'` (no progressive fade, e.g. the
+        relight checkpoint uses `dist2level='round'`). The fixed shadow-only
+        decoder consumes the returned values so the caster NEVER depends on which
+        receiver view last called `set_anchor_mask()` (guide §20.2 item 2).
+        """
         anchor = self.get_anchor                                    # jt.Var [N, 3]
         level = self._level.reshape(-1)                              # jt.Var [N]
         extra = self._extra_level.reshape(-1)                        # jt.Var [N]
-        if isinstance(cam_center, jt.Var):
-            cc = cam_center
-        else:
-            cc = jt.array(cam_center)
-        dist = jt.norm(anchor - cc, dim=1) * resolution_scale + jt.float32(1e-10)
+        cc = cam_center if isinstance(cam_center, jt.Var) else jt.array(cam_center)
+        # Match the PyTorch reference: LOD distance is measured from the voxel
+        # centre rather than its stored lower-corner anchor.
+        voxel_offset = (self.voxel_size * 0.5) * jt.exp(
+            -self._level.float32() * math.log(float(self.fork)))
+        anchor_pos = anchor + voxel_offset
+        dist = jt.norm(anchor_pos - cc, dim=1) * resolution_scale + jt.float32(1e-10)
         pred_level = jt.log2(self.standard_dist / jt.maximum(dist, jt.float32(1e-10)))
         pred_level = pred_level / math.log2(self.fork) + extra
-        pred_level = pred_level.clamp(-1e9, 1e9)  # NaN→clamp limit
+        pred_level = pred_level.clamp(-1e9, 1e9)                     # NaN→clamp limit
+        if coarse_index is None:
+            coarse_index = self.levels
+        cur_level = coarse_index - 1
+        if self.dist2level == 'floor':
+            int_level = jt.floor(pred_level).int().clamp(0, cur_level)
+            prog_ratio = transition_mask = None
+        elif self.dist2level == 'round':
+            int_level = jt.round(pred_level).int().clamp(0, cur_level)
+            prog_ratio = transition_mask = None
+        elif self.dist2level == 'ceil':
+            int_level = jt.ceil(pred_level).int().clamp(0, cur_level)
+            prog_ratio = transition_mask = None
+        elif self.dist2level == 'progressive':
+            pl = jt.clamp(pred_level + 1.0, 0.9999, cur_level + 0.9999)
+            int_level = jt.floor(pl).int()
+            prog_ratio = jt.frac(pl).unsqueeze(dim=1)
+            transition_mask = (level == int_level)
+        else:
+            raise ValueError(f"Unknown dist2level: {self.dist2level}")
+        anchor_mask = (level <= int_level)
+        return anchor_mask, prog_ratio, transition_mask
 
+    def set_anchor_mask(self, cam_center, iteration, resolution_scale,is_training = False):
         is_training = self.get_color_mlp.training
         if self.progressive and is_training:
             coarse_index = np.searchsorted(self.coarse_intervals, iteration) + 1 + self.init_level
         else:
             coarse_index = self.levels
-
-        int_level = jt.floor(pred_level).int32().clamp(0, coarse_index - 1)
-        self._anchor_mask = (level <= int_level)  # GPU bool tensor（Phase 78: 消除 CPU 规避，和 PT 一致）
+        # N2.5-B: pure compute + explicit write-back (no reliance on
+        # map_to_int_level's side effect inside the receiver-collection loop).
+        anchor_mask, prog_ratio, transition_mask = self.compute_anchor_lod_state(
+            cam_center, resolution_scale, coarse_index)
+        self._anchor_mask = anchor_mask
+        if prog_ratio is not None:
+            self._prog_ratio = prog_ratio
+            self.transition_mask = transition_mask
 
 
     def set_anchor_mask_perlevel(self, cam_center, resolution_scale, cur_level):
@@ -980,11 +1075,14 @@ class GaussianModel:
             cc = cam_center
         else:
             cc = jt.array(cam_center)
-        dist = jt.norm(anchor - cc, dim=1) * resolution_scale + jt.float32(1e-10)
+        voxel_offset = (self.voxel_size * 0.5) * jt.exp(
+            -self._level.float32() * math.log(float(self.fork)))
+        anchor_pos = anchor + voxel_offset
+        dist = jt.norm(anchor_pos - cc, dim=1) * resolution_scale + jt.float32(1e-10)
         pred_level = jt.log2(self.standard_dist / jt.maximum(dist, jt.float32(1e-10)))
         pred_level = pred_level / math.log2(self.fork) + extra
         pred_level = pred_level.clamp(-1e9, 1e9)
-        int_level = jt.floor(pred_level).int32().clamp(0, cur_level)
+        int_level = self.map_to_int_level(pred_level, cur_level)
         self._anchor_mask = (level <= int_level)  # GPU bool tensor（和 PT 一致，Phase 78 修复）
 
     def training_setup(self, training_args, reset_stats=True):
@@ -2067,7 +2165,9 @@ class GaussianModel:
             delta_normal1 = (delta_normal1-0.5)*2
             delta_normal2 = (delta_normal2-0.5)*2
             delta_normal = jt.stack([delta_normal1, delta_normal2], dim=-1) # (N, 3, 2)
-            idx = positive.long()[:,None,:].repeat(1, 3, 1)  # False→0, True→1 (avoids jt.where CUDA-only issue)
+            # PyTorch reference: where(positive, 0, 1).  Jittor bool-to-int is
+            # True→1/False→0, so invert it instead of using positive directly.
+            idx = (1 - positive.int32())[:,None,:].repeat(1, 3, 1)
             delta_normal = jt.gather(delta_normal, index=idx, dim=-1).squeeze(-1) # (N, 3)
             normal = delta_normal + normal_axis 
             normal = normal/normal.norm(dim=1, keepdim=True) # (N, 3)
@@ -2076,13 +2176,11 @@ class GaussianModel:
             return normal_axis
 
 
-    
+
     def position_normal(self,points):
         if self.centroid is None:
             self.centroid = jt.mean(self._anchor, dim=0)
         points_centered = points - self.centroid
         scale = jt.max(jt.norm(points_centered, dim=1))
-        normalized_points = (points_centered / scale + 1) / 2 
+        normalized_points = (points_centered / scale + 1) / 2
         return normalized_points
-
-    

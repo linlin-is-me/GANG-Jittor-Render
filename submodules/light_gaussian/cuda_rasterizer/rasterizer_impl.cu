@@ -732,7 +732,11 @@ int CudaRasterizer::Rasterizer::lite_forward(
 	float* out_color,
 	float* out_opacity,
 	float* out_depth,
-	int* radii)
+	int* radii,
+	const int num_boundaries,
+	const float* boundaries,
+	float* out_transmit,
+	float* out_final)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -853,7 +857,141 @@ int CudaRasterizer::Rasterizer::lite_forward(
 		out_color,
 		out_opacity,
 		out_depth,
-		argmax_depth);
+		argmax_depth,
+		num_boundaries,
+		boundaries,
+		out_transmit);
+
+	// P4.1: expose the end-of-ray final transmittance (already written into
+	// imgState.accum_alpha by liteRenderCUDA) for receivers past the last
+	// boundary. Pure D2D copy; old callers pass nullptr and stay unchanged.
+	if (out_final != nullptr)
+		cudaMemcpy(out_final, imgState.accum_alpha,
+			(size_t)width * (size_t)height * sizeof(float), cudaMemcpyDeviceToDevice);
+
+	return num_rendered;
+}
+
+
+
+// §28.6 E1: inference-only receiver-exact forward. Reuses lite_forward's exact
+// preprocess / scan / duplicateWithKeys / radix-sort / identifyTileRanges flow,
+// then answers the face's per-receiver prefix-transmittance queries instead of
+// rasterising colour. `pixel_offsets` [res*res+1] and `q_sorted` [G_face] come
+// from the §28.4 layout; output `out_transmit` [G_face] is the sorted T. The old
+// lite_forward ABI is untouched.
+int CudaRasterizer::Rasterizer::receiver_forward(
+	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> binningBuffer,
+	std::function<char* (size_t)> imageBuffer,
+	const int P, int D, int M,
+	const int width, int height,
+	const float* means3D,
+	const float* colors_precomp,
+	const float* opacities,
+	const float* scales,
+	const float scale_modifier,
+	const float* rotations,
+	const float* cov3D_precomp,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const float* cam_pos,
+	const float tan_fovx, float tan_fovy,
+	const bool prefiltered,
+	const int64_t* pixel_offsets,
+	const float* q_sorted,
+	float* out_transmit)
+{
+	const float focal_y = height / (2.0f * tan_fovy);
+	const float focal_x = width / (2.0f * tan_fovx);
+
+	size_t chunk_size = required<GeometryState>(P);
+	char* chunkptr = geometryBuffer(chunk_size);
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+
+	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+	dim3 block(BLOCK_X, BLOCK_Y, 1);
+
+	size_t img_chunk_size = required<ImageState>(width * height);
+	char* img_chunkptr = imageBuffer(img_chunk_size);
+	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+
+	const float* normal3D_precomp = nullptr;
+	FORWARD::preprocess(
+		P, D, M,
+		means3D,
+		(glm::vec3*)scales,
+		scale_modifier,
+		(glm::vec4*)rotations,
+		opacities,
+		nullptr,                     // shs (receiver query uses no colour)
+		geomState.clamped,
+		cov3D_precomp,
+		normal3D_precomp,
+		colors_precomp,              // dummy colours -> skips the SH path
+		viewmatrix,
+		projmatrix,
+		(glm::vec3*)cam_pos,
+		width, height,
+		focal_x, focal_y,
+		tan_fovx, tan_fovy,
+		geomState.internal_radii,
+		geomState.means2D,
+		geomState.depths,
+		geomState.cov3D,
+		geomState.norm3D,
+		geomState.rgb,
+		geomState.conic_opacity,
+		tile_grid,
+		geomState.tiles_touched,
+		prefiltered);
+
+	cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size,
+		geomState.tiles_touched, geomState.point_offsets, P);
+
+	int num_rendered;
+	cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost);
+
+	size_t binning_chunk_size = required<BinningState>(num_rendered);
+	char* binning_chunkptr = binningBuffer(binning_chunk_size);
+	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
+
+	duplicateWithKeys<<<(P + 255) / 256, 256>>>(
+		P,
+		geomState.means2D,
+		geomState.depths,
+		geomState.point_offsets,
+		binningState.point_list_keys_unsorted,
+		binningState.point_list_unsorted,
+		geomState.internal_radii,
+		tile_grid);
+
+	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+	cub::DeviceRadixSort::SortPairs(
+		binningState.list_sorting_space,
+		binningState.sorting_size,
+		binningState.point_list_keys_unsorted, binningState.point_list_keys,
+		binningState.point_list_unsorted, binningState.point_list,
+		num_rendered, 0, 32 + bit);
+
+	cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2));
+	if (num_rendered > 0)
+		identifyTileRanges<<<(num_rendered + 255) / 256, 256>>>(
+			num_rendered,
+			binningState.point_list_keys,
+			imgState.ranges);
+
+	FORWARD::receiver_query(
+		tile_grid, block,
+		width, height,
+		imgState.ranges,
+		binningState.point_list,
+		geomState.means2D,
+		geomState.conic_opacity,
+		geomState.depths,
+		pixel_offsets,
+		q_sorted,
+		out_transmit);
 
 	return num_rendered;
 }

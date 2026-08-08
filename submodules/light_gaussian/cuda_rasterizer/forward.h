@@ -15,6 +15,7 @@
 #include <cuda.h>
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
+#include <cstdint>
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
 
@@ -106,8 +107,24 @@ namespace FORWARD
     float* out_color,
     float* out_opacity,
     float* out_depth,
-    bool argmax_depth);
-    
+    bool argmax_depth,
+    int num_boundaries = 0,
+    const float* boundaries = nullptr,
+    float* out_transmit = nullptr);
+
+  // §28.6 E1: per-pixel multi-receiver prefix-transmittance query (one face).
+  void receiver_query(
+    const dim3 grid, dim3 block,
+    int W, int H,
+    const uint2* ranges,
+    const uint32_t* point_list,
+    const float2* points_xy_image,
+    const float4* conic_opacity,
+    const float* depth,
+    const int64_t* pixel_offsets,
+    const float* q_sorted,
+    float* out_transmit);
+
   void depthToNormal(
     const dim3 grid,
     const dim3 block,

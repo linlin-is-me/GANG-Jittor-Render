@@ -270,7 +270,72 @@ class GaussianRasterizer(nn.Module):
                 raster_settings.projmatrix)
         return visible
 
-    def execute(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3Ds_precomp = None, norm3Ds_precomp=None, extra_attrs=None):
+    def _execute_inference(self, means3D, means2D, shs, colors_precomp, opacities,
+                           scales, rotations, cov3Ds_precomp, norm3Ds_precomp, extra_attrs,
+                           return_aux=True):
+        """M2 (P0): inference-only rasterize — direct RasterizeGaussiansCUDA call,
+        NO jt.Function tape, NO save_for_backward, NO diagnostic refs (_last_*_input,
+        _last_rasterize_func). Scratch buffers are released right after forward_1 so
+        multi-view inference does not accumulate the previous view's Geometry/Binning/
+        Image buffers (previously retained via _gr._last_rasterizer)."""
+        raster_settings = self.raster_settings
+
+        if shs is None:
+            shs = jt.array([])
+        if colors_precomp is None:
+            colors_precomp = jt.array([])
+        if scales is None:
+            raise ValueError('To support norm and depth prediction, scales == None is not allowed')
+        if rotations is None:
+            raise ValueError('To support norm and depth prediction, rotations == None is not allowed')
+        if cov3Ds_precomp is None:
+            cov3Ds_precomp = jt.array([])
+        if norm3Ds_precomp is None:
+            norm3Ds_precomp = jt.array([])
+        if extra_attrs is None:
+            extra_attrs = jt.array([])
+
+        num_rendered, num_contrib, color, depth, opacity, norm, alpha, extra, radii, \
+            geomBuffer, binningBuffer, imgBuffer = RasterizeGaussiansCUDA(
+                raster_settings.bg, means3D, colors_precomp, opacities, scales, rotations,
+                raster_settings.scale_modifier, cov3Ds_precomp, norm3Ds_precomp, extra_attrs,
+                raster_settings.viewmatrix, raster_settings.projmatrix,
+                raster_settings.tanfovx, raster_settings.tanfovy,
+                raster_settings.image_height, raster_settings.image_width,
+                shs, raster_settings.sh_degree, raster_settings.campos,
+                raster_settings.prefiltered, raster_settings.debug)
+
+        # M2 (P0, bisect F): drop the Python refs to scratch buffers; the caller's
+        # frame cleanup (del pkg + sync_all(True) + gc) handles device-sync/collect.
+        # (Removed the in-rasterizer sync_all(True)+gc — redundant with the frame
+        # cleanup and was a suspect for premature SFRL free between views.)
+        del geomBuffer, binningBuffer, imgBuffer
+
+        # Post-processing (inlined from rasterize_gaussians / execute)
+        if return_aux:
+            norm = jt.normalize(norm, p=2, dim=0)
+            focal_x = raster_settings.image_width / (2.0 * raster_settings.tanfovx)
+            focal_y = raster_settings.image_height / (2.0 * raster_settings.tanfovy)
+            depth_filter = depth
+            normal_from_depth = depthToNormal(
+                depth_filter.squeeze(0) if depth_filter.ndim == 3 else depth_filter,
+                raster_settings.viewmatrix,
+                focal_x,
+                focal_y,
+            )
+        else:
+            # RGB-only inference does not need the additional full-resolution
+            # depth-derived normal image (~200 MiB at 5187x3361).
+            normal_from_depth = jt.array([])
+        return num_contrib, color, depth, opacity, norm, normal_from_depth, alpha, radii, extra
+
+    def execute(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3Ds_precomp = None, norm3Ds_precomp=None, extra_attrs=None, inference_only=False, return_aux=True):
+
+        # M2 (P0): inference-only path — no tape, no save_for_backward, no retention.
+        if inference_only:
+            return self._execute_inference(
+                means3D, means2D, shs, colors_precomp, opacities, scales, rotations,
+                cov3Ds_precomp, norm3Ds_precomp, extra_attrs, return_aux=return_aux)
 
         raster_settings = self.raster_settings
 
