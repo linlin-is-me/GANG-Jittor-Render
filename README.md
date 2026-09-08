@@ -1,12 +1,10 @@
 # GANG-Jittor-Render：基于计图的场景级神经高斯可重光照渲染器
 
-当前代码已恢复为 2026-09-08 实测使用的本地推理源码及测速依赖，来源为当时的上传归档与最终补丁。RTX 4090、Garden 40K、res4、24 视角完整前向平均 **59.6289 ms/帧（16.7704 FPS）**，原版 PyTorch 为 **87.8299 ms/帧**。这是历史同机实测结果，不保证其他环境得到相同速度。使用入口与完整条件见 [实测版本说明](docs/measured_inference.md)。
-
-推荐入口 `tools/render_measured.py` 显式启用 `vector3_cuda`。底层模块默认 `native` 保持与实测源码一致；不要用未加开关的旧入口代表优化版本。SG 算子细节见 [归约说明](docs/sg_vector3.md)。
+新增可选 SG 推理后端 `vector3_cuda`，默认仍为 `native`。使用方法、本地与发布代码的差异以及已有测速的适用范围见 [SG 三分量归约说明](docs/sg_vector3.md)。本次选择性移植尚未在 GPU 上重新完成端到端测速。
 
 新增原版 GANG PBR `.pth → .npz` 转换器，支持 21 项模型 capture、配套灯光与显式 LOD 元数据，详见 [检查点转换说明](docs/checkpoint_conversion.md)。
 
-本项目将 GANG（Geometrically-Aligned Neural Gaussians）的核心推理管线迁移至计图（Jittor）。完成 checkpoint 格式转换后，Jittor 推理运行时不依赖 PyTorch。下文保留旧发布基线的 33.92 dB PSNR、0.9951 SSIM 和历史图片；这些指标与文首 2026-09-08 实测采用的模型、代码状态不同，不能混用。
+本项目将 GANG（Geometrically-Aligned Neural Gaussians）的核心推理管线迁移至计图（Jittor）。完成 checkpoint 格式转换后，Jittor 推理运行时不依赖 PyTorch。Garden 40K 模型在固定的 `res=4`、24 个测试视角和 PBR + 16 SG 配置下，与 PyTorch 参考输出达到 33.92 dB PSNR 和 0.9951 SSIM；该结论只适用于下文记录的固定实验基线。
 
 ![Garden DSC08066 在原始学习光照与 14 个外部 HDR envmap 下的重光照结果](assets/envmap_relighting_garden_dsc08066_3x5.png)
 
@@ -78,11 +76,11 @@ SG 波瓣卷积包含相近浮点数相减。粗糙度较低时，锐度参数�
 
 ### 2.7 显存管理
 
-当前实测推理路径的内存策略：
+当前推理路径采用三类显存控制措施：
 
-- 已取消旧版在非 PBR MLP 与材质 MLP 之间的强制同步回收；
+- 在非 PBR MLP 与材质 MLP 之间同步并回收懒执行图；
 - 使用无 Tape 的推理专用光栅前向，并释放光栅 scratch buffer 引用；
-- 释放不再需要的中间张量引用，不保留旧版各光照阶段之间的强制同步回收。
+- 在 SG 镜面、漫反射和 envmap 阶段之间显式释放大尺寸中间张量。
 
 这些措施用于控制多 MLP、数百万神经高斯和高分辨率光栅化共同产生的峰值显存。若需公开显存结论，应同时报告模型、分辨率、视角数、显卡、光照模式和完整进程峰值，避免把单一阶段的显存增量写成整条管线的峰值。
 
@@ -92,7 +90,7 @@ SG 波瓣卷积包含相近浮点数相减。粗糙度较低时，锐度参数�
 
 ![图 5 从上到下依次为 0K、25K、40K，左侧为 PyTorch，右侧为 Jittor](assets/图%205从上到下依次为0、25k、40k三阶段Pytorch（左）和Jittor（右）并排渲染对比.png)
 
-以下为旧发布基线的历史结果，不代表当前实测代码重新运行得到的指标。2026-09-08 的版本、模型与结果见文首实测版本说明。历史实验使用各阶段对应的模型状态和同一组相机，在 `res=4` 下渲染 24 个测试视角。
+以下结果来自 Garden 场景的固定实验产物。Jittor 与 PyTorch 使用各阶段对应的模型状态和同一组相机，在 `res=4` 下渲染 24 个测试视角。
 
 | 指标 | 0K（随机初始化） | 25K（几何阶段） | 40K（PBR 阶段） |
 |------|:---:|:---:|:---:|
@@ -179,13 +177,20 @@ pip install -r requirements.txt
 
 ### 编译 CUDA 光栅库
 
-实测版本使用 stable 构建脚本，需要 CUDA Toolkit、`nvcc`、支持 C++17 的编译器及 binutils。仓库不提交预编译 `.so`；RTX 4090 使用 SM 89。不能继续沿用旧版只复制动态库的构建方式，新运行时还读取匹配的构建清单。
+源码构建需要 CMake 3.20 或更高版本、CUDA Toolkit 与 `nvcc`、支持 C++17 的编译器、`make`，以及提供 `nm` 的 binutils。仓库不提交预编译 `.so`。当前 CMake 配置包含 SM 70/75/86；RTX 4060（SM 89）的已验证环境沿用 SM 86 cubin。重新执行 CMake 不会自动加入新架构，因为 `CUDA_ARCHITECTURES` 仍在 `submodules/light_gaussian/CMakeLists.txt` 中固定设置。
 
 ```bash
-GANG_CUDA_ARCHS=89 bash submodules/light_gaussian/_rebuild.sh stable
+cd submodules/light_gaussian
+mkdir -p build && cd build
+cmake ..
+make
+cp -f libCudaRasterizer.so librasterizer.so
+nm -D librasterizer.so | grep -q 'lite_forward'
+nm -D librasterizer.so | grep -q 'receiver_forward'
+cd ../../..
 ```
 
-脚本保留实测时已有的 ABI 与构建身份检查，不对权重或数据额外计算哈希。本发布仅支持 `stable` 光栅版本，不提供历史候选生成器。更换 GPU 架构需要重新验证输出和稳定性。
+CMake 目标生成 `libCudaRasterizer.so`，运行时读取 `librasterizer.so`，因此复制步骤不能省略。当前扩展还要求 `lite_forward` 和 `receiver_forward` 两个导出符号。修改目标架构后，需要重新验证光栅输出、导出符号和多视角稳定性。
 
 ### 当前入口与 checkpoint 格式
 
