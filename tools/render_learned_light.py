@@ -106,6 +106,8 @@ def main():
     ap.add_argument('--views', default='0 1 2',
                     help='camera indices to render (space-separated, quoted)')
     ap.add_argument('--res', type=int, default=4)
+    ap.add_argument('--sg-reduce-backend', choices=('native', 'vector3_cuda'),
+                    default='native', help='Inference-only SG reduction backend')
     ap.add_argument('--base-res', type=int, default=256)
     ap.add_argument('--exposure', type=float, default=0.0)
     ap.add_argument('--output-dir', default='outputs/learned_light',
@@ -139,7 +141,7 @@ def main():
                       lp.add_level, lp.visible_threshold, lp.dist2level,
                       lp.base_layer, lp.progressive, lp.extend,
                       is_pbr=True, normal_detal=False, with_matallic=True)
-    g.restore_numpy(model_args)
+    g.restore_numpy(model_args, metadata=meta)
     g.eval()
     N = g.get_anchor.shape[0]
     print(f"[restore] anchors={N}")
@@ -149,6 +151,7 @@ def main():
     # ---- light: restore the TRAINED light, KEEP the learned SGs ---------------
     light = Hybridlight(base_res=args.base_res, num_sg=TRAINING_SG_COUNT,
                         cache_dir=OUT_DIR)
+    light.sg_reduce_backend = args.sg_reduce_backend
     light.load_from_numpy(light_state)              # base + lgtSGs + BRDF params
     sg = light.lgtSGs.numpy()
     mu = np.abs(sg[:, -3:])
@@ -210,6 +213,7 @@ def main():
         'camera_indices': views,
         'image_sizes': {str(v): view_stats[v]['image_size'] for v in views},
         'sg_count': int(light.numLgtSGs),
+        'sg_reduce_backend': args.sg_reduce_backend,
         'sg_trained': TRAINING_SG_COUNT,
         'sg_stats': {'lambda_min': float(lam.min()), 'lambda_max': float(lam.max()),
                      'mu_total': float(np.sum(mu)), 'mu_max': float(np.max(mu)),

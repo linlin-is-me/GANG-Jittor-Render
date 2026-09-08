@@ -36,6 +36,24 @@ from utils.light_utils import DistributionGGX,GeometrySmith,fresnelSchlick
 TINY_NUMBER = 1e-6
 
 
+def _sg_dot3(a, b, backend):
+    if backend == 'native':
+        return jt.sum(a*b, dim=-1, keepdim=True)
+    from .sg_vector3 import dot3
+    return dot3(a, b)
+
+
+
+def _sg_norm3(a, backend):
+    if backend == 'native':
+        return jt.norm(a, dim=-1, keepdim=True)
+    from .sg_vector3 import norm3
+    # jt.norm(p=2) clamps the squared sum before sqrt, in addition to the
+    # caller's denominator epsilon. Preserve both protections independently.
+    return norm3(a, eps=1e-30)
+
+
+
 ######################################################################################
 # Utility functions
 ######################################################################################
@@ -109,6 +127,7 @@ class Hybridlight(nn.Module):
         self.sg_distance_attenuation = True
         self.sg_min_roughness = 1e-5
         self.sg_clamp_diffuse = True
+        self.sg_reduce_backend = 'native'
 
         # Experimental point-light path for relighting inference. It is disabled
         # by default and is not part of checkpoint training or baseline replay.
@@ -502,6 +521,11 @@ class Hybridlight(nn.Module):
         return render_rgb, extras
     
     def sg_render(self,normal,viewdirs,points,albedo,roughness,metallic):
+        backend = self.sg_reduce_backend
+        if backend not in ('native', 'vector3_cuda'):
+            raise ValueError('unknown sg_reduce_backend: '+str(backend))
+        if backend == 'vector3_cuda' and not jt.flags.no_grad:
+            raise RuntimeError('vector3_cuda is inference-only; use jt.no_grad()')
         N, _ = normal.shape
         M = self.lgtSGs.shape[0]
 
@@ -521,12 +545,12 @@ class Hybridlight(nn.Module):
         #### note: sanity
         lgtSGPosition = lgtSGs[..., :3]  # [N, M, 3]
         lgtSGLobes = lgtSGs[..., 3:6] / (
-                jt.norm(lgtSGs[..., 3:6], dim=-1, keepdim=True) + TINY_NUMBER)  # [N, M, 3]
+                _sg_norm3(lgtSGs[..., 3:6], backend) + TINY_NUMBER)  # [N, M, 3]
         lgtSGLambdas = jt.abs(lgtSGs[..., 6:7])
         lgtSGMus = jt.abs(lgtSGs[..., -3:])  # positive values
 
         if self.sg_distance_attenuation:
-            decay_weight = compute_weight(point_sg, lgtSGPosition)  # [N, M]
+            decay_weight = compute_weight(point_sg, lgtSGPosition, backend)  # [N, M]
         else:
             decay_weight = jt.ones([N, M], dtype=jt.float32)
 
@@ -538,12 +562,12 @@ class Hybridlight(nn.Module):
         brdfSGMus = (inv_roughness_pow4 / np.pi)  # [N, M, 3]
        
         # perform spherical warping
-        v_dot_lobe = jt.sum(brdfSGLobes * viewdirs_sg, dim=-1, keepdim=True)  # [N, M, 1]
+        v_dot_lobe = _sg_dot3(brdfSGLobes, viewdirs_sg, backend)
         ### note: for numeric stability
         v_dot_lobe = v_dot_lobe.clamp(0.0)  # [N, M, 1]
         warpBrdfSGLobes = 2 * v_dot_lobe * brdfSGLobes - viewdirs_sg  # [N, M, 3]
         warpBrdfSGLobes = warpBrdfSGLobes / (
-                    jt.norm(warpBrdfSGLobes, dim=-1, keepdim=True) + TINY_NUMBER)  # [N, M, 3]
+                    _sg_norm3(warpBrdfSGLobes, backend) + TINY_NUMBER)  # [N, M, 3]
         # warpBrdfSGLambdas = brdfSGLambdas / (4 * jt.abs(jt.sum(brdfSGLobes * viewdirs, dim=-1, keepdim=True)) + TINY_NUMBER)
        
         warpBrdfSGLambdas = brdfSGLambdas / (4 * v_dot_lobe + TINY_NUMBER)  # # [N, M, 1] can be huge
@@ -551,8 +575,8 @@ class Hybridlight(nn.Module):
 
         # add fresnel and geometric terms; apply the smoothness assumption in SG paper
         new_half = warpBrdfSGLobes + viewdirs_sg  # [N, M, 3]
-        new_half = new_half / (jt.norm(new_half, dim=-1, keepdim=True) + TINY_NUMBER)  # [N, M, 3]
-        v_dot_h = jt.sum(viewdirs_sg * new_half, dim=-1, keepdim=True)  # [N, M, 1]
+        new_half = new_half / (_sg_norm3(new_half, backend) + TINY_NUMBER)
+        v_dot_h = _sg_dot3(viewdirs_sg, new_half, backend)
         ### note: for numeric stability
         v_dot_h = v_dot_h.clamp(0.0)  # [N, M, 1]
         specular_reflectance = albedo_sg
@@ -561,10 +585,10 @@ class Hybridlight(nn.Module):
                 5.55473 * v_dot_h + 6.8316) * v_dot_h)  # [N, M, 1]
         
 
-        dot1 = jt.sum(warpBrdfSGLobes * normal_sg, dim=-1, keepdim=True)  # [N, M, 1]
+        dot1 = _sg_dot3(warpBrdfSGLobes, normal_sg, backend)
         ### note: for numeric stability
         dot1 = dot1.clamp(0.0)  # [N, M, 1]
-        dot2 = jt.sum(viewdirs_sg * normal_sg, dim=-1, keepdim=True)  # [N, M, 1]
+        dot2 = _sg_dot3(viewdirs_sg, normal_sg, backend)
         ### note: for numeric stability
         dot2 = dot2.clamp(0.0)
         k = (roughness_sg + 1.) * (roughness_sg + 1.) / 8.  # [N, M, 1]
@@ -577,15 +601,15 @@ class Hybridlight(nn.Module):
 
         # multiply with light sg
         final_lobes, final_lambdas, final_mus = lambda_trick(lgtSGLobes, lgtSGLambdas, lgtSGMus,
-                                                                warpBrdfSGLobes, warpBrdfSGLambdas, warpBrdfSGMus)
+                                                                warpBrdfSGLobes, warpBrdfSGLambdas, warpBrdfSGMus, backend)
         mu_cos = 32.7080
         lambda_cos = 0.0315
         alpha_cos = 31.7003
         lobe_prime, lambda_prime, mu_prime = lambda_trick(normal_sg, lambda_cos, mu_cos,
-                                                            final_lobes, final_lambdas, final_mus)
+                                                            final_lobes, final_lambdas, final_mus, backend)
         # print("lobe_prime",lobe_prime.max(), lambda_prime.max(), mu_prime.max(),)
-        dot1 = jt.sum(lobe_prime * normal_sg, dim=-1, keepdim=True)  # [N, M, 1]
-        dot2 = jt.sum(final_lobes * normal_sg, dim=-1, keepdim=True)  # [N, M, 1]
+        dot1 = _sg_dot3(lobe_prime, normal_sg, backend)
+        dot2 = _sg_dot3(final_lobes, normal_sg, backend)
 
         # Phase 91: float64 subtraction to avoid 115× cancellation amplification.
         # term1 ≈ term2 → tiny float32 errors in each term get magnified.
@@ -602,14 +626,12 @@ class Hybridlight(nn.Module):
         # path re-binds final_lobes/final_mus/final_lambdas/lobe_prime/mu_prime/
         # dot1/dot2 below, and needs normal_sg/albedo_sg/metallic_sg/lgtSGLobes/
         # lgtSGLambdas/lgtSGMus/decay_weight/specular_rgb_sg.
-        # jt.sync_all(True) waits for the device before SFRL reclaims blocks.
         del viewdirs_sg, point_sg, roughness_sg, lgtSGs, lgtSGPosition, inv_roughness_pow4, \
             brdfSGLambdas, brdfSGMus, v_dot_lobe, warpBrdfSGLobes, warpBrdfSGLambdas, \
             warpBrdfSGMus, new_half, v_dot_h, F, k, G1, G2, G, Moi, H1, H2, \
             final_lobes, final_lambdas, final_mus, lobe_prime, lambda_prime, mu_prime, \
             dot1, dot2, specular_reflectance
         jt.sync_all(True); jt.gc()
-
         # diffuse color
         diffuse = (1-metallic_sg)*albedo_sg / np.pi  # [N, M, 3]
        
@@ -621,10 +643,10 @@ class Hybridlight(nn.Module):
 
         # now multiply with clamped cosine, and perform hemisphere integral
         lobe_prime, lambda_prime, mu_prime = lambda_trick(normal_sg, lambda_cos, mu_cos,
-                                                            final_lobes, final_lambdas, final_mus)
+                                                            final_lobes, final_lambdas, final_mus, backend)
 
-        dot1 = jt.sum(lobe_prime * normal_sg, dim=-1, keepdim=True)
-        dot2 = jt.sum(final_lobes * normal_sg, dim=-1, keepdim=True)
+        dot1 = _sg_dot3(lobe_prime, normal_sg, backend)
+        dot2 = _sg_dot3(final_lobes, normal_sg, backend)
         diffuse_rgb_sg = (mu_prime.float64() * hemisphere_int(lambda_prime, dot1).float64() -
                            final_mus.float64() * (alpha_cos * hemisphere_int(final_lambdas, dot2).float64())).float32()
         
@@ -1369,18 +1391,22 @@ def hemisphere_int(lambda_val, cos_beta):
 
 
 
-def compute_weight(point_sg,lgtSGPosition):
+def compute_weight(point_sg,lgtSGPosition, sg_reduce_backend='native'):
     diff = (lgtSGPosition-point_sg)
     squared_diff = diff ** 2  # 每个维度的差值平方
-    distance = jt.sqrt(squared_diff.sum(dim=-1)) #(N, K)
+    if sg_reduce_backend == 'native':
+        distance = jt.sqrt(squared_diff.sum(dim=-1)) #(N, K)
+    else:
+        from .sg_vector3 import norm3
+        distance = norm3(diff).squeeze(-1)
     return jt.exp(-0.4*distance)
 
 
-def lambda_trick(lobe1, lambda1, mu1, lobe2, lambda2, mu2):
+def lambda_trick(lobe1, lambda1, mu1, lobe2, lambda2, mu2, sg_reduce_backend='native'):
     # assume lambda1 << lambda2
     ratio = lambda1 / lambda2
 
-    dot = jt.sum(lobe1 * lobe2, dim=-1, keepdim=True)
+    dot = _sg_dot3(lobe1, lobe2, sg_reduce_backend)
     tmp = jt.sqrt(ratio * ratio + 1. + 2. * ratio * dot)
     tmp = jt.minimum(tmp, ratio + 1.)
 
@@ -1392,7 +1418,7 @@ def lambda_trick(lobe1, lambda1, mu1, lobe2, lambda2, mu2):
     # When both lambdas are tensors (BRDF×light SG path), compute ratio/dot/tmp/diff/exp in float64.
     if hasattr(lambda1, 'float64') and hasattr(lambda2, 'float64'):
         r_f64 = lambda1.float64() / lambda2.float64()
-        d_f64 = jt.sum(lobe1.float64() * lobe2.float64(), dim=-1, keepdim=True)
+        d_f64 = _sg_dot3(lobe1.float64(), lobe2.float64(), sg_reduce_backend)
         t_f64 = jt.sqrt(r_f64 * r_f64 + 1.0 + 2.0 * r_f64 * d_f64)
         t_f64 = jt.minimum(t_f64, r_f64 + 1.0)
         diff = lambda2.float64() * (t_f64 - r_f64 - 1.0)
@@ -1407,7 +1433,7 @@ def lambda_trick(lobe1, lambda1, mu1, lobe2, lambda2, mu2):
         # lambda1 or lambda2 is a Python float → ratio is a jt.Var broadcast from scalar.
         # diff = lambda2 * (tmp - ratio - 1.0) — still cancellation-prone if lambda2 is large.
         ratio = lambda1 / lambda2
-        dot = jt.sum(lobe1 * lobe2, dim=-1, keepdim=True)
+        dot = _sg_dot3(lobe1, lobe2, sg_reduce_backend)
         tmp = jt.sqrt(ratio * ratio + 1. + 2. * ratio * dot)
         tmp = jt.minimum(tmp, ratio + 1.)
         lambda3 = lambda2 * tmp

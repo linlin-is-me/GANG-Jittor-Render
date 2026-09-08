@@ -34,11 +34,15 @@ def main():
     parser.add_argument('--resolution', type=int, required=True,
                         help='resolution divisor used during training')
     parser.add_argument('--is_pbr', type=int, default=0)
+    parser.add_argument('--sg-reduce-backend', choices=('native', 'vector3_cuda'),
+                        default='native', help='SG inference reduction backend (PBR only)')
     parser.add_argument('--start_idx', type=int, default=0, help='First camera index to render')
     parser.add_argument('--end_idx', type=int, default=-1, help='Last camera index (exclusive, -1 = all)')
     args = parser.parse_args()
 
     is_pbr = bool(args.is_pbr)
+    if not is_pbr and args.sg_reduce_backend != 'native':
+        parser.error('--sg-reduce-backend vector3_cuda requires --is_pbr 1')
     npz_path = args.npz
     out_dir = args.out_dir
     os.makedirs(os.path.join(out_dir, 'render'), exist_ok=True)
@@ -124,6 +128,7 @@ def main():
     if is_pbr:
         from scene.NVDIFFREC.light import Hybridlight
         light = Hybridlight(base_res=256, num_sg=16, cache_dir=os.path.dirname(npz_path))
+        light.sg_reduce_backend = args.sg_reduce_backend
         if light_state is not None:
             light.load_from_numpy(light_state)
         print("  PBR cubemap loaded")
@@ -140,9 +145,10 @@ def main():
 
         try: g.set_anchor_mask(cam.camera_center, 99999, cam.resolution_scale)
         except: pass
-        voxel_mask = prefilter_voxel(cam, g, pipe, bg)
-        render_pkg = render(cam, g, pipe, bg, visible_mask=voxel_mask,
-                            is_pbr=is_pbr, light=light, is_training=False)
+        with jt.no_grad():
+            voxel_mask = prefilter_voxel(cam, g, pipe, bg)
+            render_pkg = render(cam, g, pipe, bg, visible_mask=voxel_mask,
+                                is_pbr=is_pbr, light=light, is_training=False)
 
         image = render_pkg["render"].float32()
         gt = cam.original_image.float32()

@@ -73,7 +73,8 @@ def sha256(path):
 # 1. Load 46-key named npz -> model args list (capture() order) + light state
 # ---------------------------------------------------------------------------
 def load_named_npz(npz_path):
-    raw = dict(np.load(npz_path, allow_pickle=True))
+    with np.load(npz_path, allow_pickle=False) as archive:
+        raw = dict(archive)
     N = raw['_anchor'].shape[0]
     K = int(raw['n_offsets'])
     print(f"[load] anchors={N}, K={K}, is_pbr={raw['is_pbr']}, with_matallic={raw['with_matallic']}")
@@ -110,6 +111,9 @@ def load_named_npz(npz_path):
     meta = {k: raw[k] for k in ('is_pbr', 'with_matallic', 'standard_dist',
                                 'n_offsets', 'feat_dim', 'fork', 'base_layer',
                                 'dist2level', 'progressive', 'extend')}
+    for key in ('voxel_size', 'levels', 'init_level', '_extra_level'):
+        if key in raw:
+            meta[key] = raw[key]
     return model_args, light_state, meta
 
 
@@ -481,7 +485,7 @@ def main():
                       lp.add_level, lp.visible_threshold, lp.dist2level,
                       lp.base_layer, lp.progressive, lp.extend,
                       is_pbr=True, normal_detal=False, with_matallic=True)
-    g.restore_numpy(model_args)
+    g.restore_numpy(model_args, metadata=meta)
     g.eval()
     K = g.n_offsets
     N = g.get_anchor.shape[0]
