@@ -12,6 +12,27 @@ _path_log_file = None
 _path_log_counts = {}  # throttle per-message-key: log first N times only
 
 
+def first_non_finite(named_values):
+    """Return the first non-finite label with one host readback on success."""
+    items = [(str(label), value) for label, value in named_values]
+    if not items:
+        return None
+    flags = [value.isfinite().all() for _, value in items]
+    aggregate = np.asarray(jt.stack(flags).all().fetch_sync()).reshape(-1)
+    if aggregate.size != 1:
+        raise RuntimeError("aggregate finite check did not produce one scalar")
+    if bool(aggregate[0]):
+        return None
+    for label, value in items:
+        finite = np.asarray(value.isfinite().all().fetch_sync()).reshape(-1)
+        if finite.size != 1:
+            raise RuntimeError(
+                f"finite check for {label} did not produce one scalar")
+        if not bool(finite[0]):
+            return label
+    raise RuntimeError("aggregate finite check failed without a non-finite leaf")
+
+
 def set_path_log(filepath):
     """Set the log file path. Call once at startup with model_path/INFO.txt."""
     global _path_log_file
@@ -36,7 +57,7 @@ def path_log(msg, throttle_key=None, throttle_max=3):
 
 
 def safe_numpy(var, fallback=None):
-    """Try var.numpy(), return fallback if CUDA-only op chain blocks it."""
+    """Materialize a NumPy value; an explicit fallback is diagnostic-only."""
     try:
         return var.numpy()
     except RuntimeError:
@@ -46,12 +67,14 @@ def safe_numpy(var, fallback=None):
         raise
 
 
-def safe_item(var, fallback=0.0):
-    """Try var.item(), return fallback if CUDA-only op chain blocks it."""
+def safe_item(var, fallback=None):
+    """Materialize a scalar without silently substituting zero."""
     try:
         return float(var.numpy())
-    except RuntimeError:
-        return fallback
+    except RuntimeError as exc:
+        if fallback is not None:
+            return fallback
+        raise RuntimeError("failed to materialize scalar Jittor value") from exc
 
 
 def safe_index(var, bool_mask):
@@ -86,12 +109,17 @@ def safe_boolean_index(var, bool_mask, fallback_np=None):
 
 
 def make_numpy_ref(var, shape, dtype=np.float32):
-    """Create a numpy reference for a jt.Var's data.
-    Use when var.numpy() fails. Returns (jt.Var, np.ndarray) pair."""
+    """Create a checked NumPy copy without zero substitution."""
     try:
         np_val = var.numpy()
-    except RuntimeError:
-        np_val = np.zeros(shape, dtype=dtype)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"failed to materialize Jittor value with expected shape {tuple(shape)} "
+            f"and dtype {np.dtype(dtype)}") from exc
+    if tuple(np_val.shape) != tuple(shape) or np_val.dtype != np.dtype(dtype):
+        raise ValueError(
+            f"materialized array contract mismatch: got {np_val.shape}/{np_val.dtype}, "
+            f"expected {tuple(shape)}/{np.dtype(dtype)}")
     return var, np_val
 
 
@@ -130,10 +158,10 @@ def memcpy_to_numpy(tensor):
     except:
         pass
 
-    # Last resort: return zeros to preserve shape
-    shape = list(tensor.shape)
-    path_log(f"[FALLBACK] memcpy_to_numpy: all methods failed, zeros shape={shape}")
-    return np.zeros(shape, dtype=np_dtype)
+    raise RuntimeError(
+        f"failed to materialize Jittor tensor with shape {tuple(tensor.shape)} "
+        f"and dtype {tensor.dtype}"
+    )
 
 
 def safe_sync_read(tensor):
@@ -156,6 +184,6 @@ def safe_sync_read(tensor):
     except:
         pass
 
-    # Last resort: all-zeros
-    import numpy as np
-    return np.zeros(tensor.shape, dtype=np.float32)
+    raise RuntimeError(
+        f"failed to synchronize Jittor tensor with shape {tuple(tensor.shape)}"
+    )

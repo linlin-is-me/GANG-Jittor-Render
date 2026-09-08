@@ -89,7 +89,13 @@ def main():
         # Phase 64: extract light state from raw dict if present
         if 'item_0' not in raw:  # raw only has non-item keys after pop
             pass  # light keys were already extracted via np_data above
-    light_state = g.restore_numpy(np_data)
+    # Legacy item archives wrap dictionaries/None in scalar object arrays.
+    # Decode those containers before the numeric-only runtime restore.
+    np_data = [value.item() if isinstance(value, np.ndarray)
+               and value.dtype == object and value.shape == () else value
+               for value in np_data]
+    light_state = g.restore_numpy(np_data, inference_only=True, build_optimizer=False)
+    g._offset = g._offset.reshape((-1, 3))
     print(f"  Restored iter {saved_iter}, anchors={g.get_anchor.shape[0]}")
 
     # Setup optimizer (needed for model internals)

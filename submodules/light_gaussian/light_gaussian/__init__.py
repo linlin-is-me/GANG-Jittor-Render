@@ -24,34 +24,185 @@ from rasterize_points_jt import (
     markVisible, depthToNormal, SurfaceAlignCUDA, SurfaceAlignBackwardCUDA,
 )
 
-# Phase 22: Global cache for CUDA backward gradients (bypass Jittor autograd crash)
-_GRAD_CACHE = {}
+
+_MEDIAN_BLUR_CUDA_HEADER = r'''
+__global__ void median_blur_3x3_forward(
+        const float* input, float* output, int* winner, int height, int width) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int count = height * width;
+    if (index >= count) return;
+    int y = index / width;
+    int x = index - y * width;
+    float values[9];
+    int sources[9];
+    int n = 0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int yy = y + dy;
+            int xx = x + dx;
+            bool valid = yy >= 0 && yy < height && xx >= 0 && xx < width;
+            values[n] = valid ? input[yy * width + xx] : 0.0f;
+            sources[n] = valid ? yy * width + xx : -1;
+            ++n;
+        }
+    }
+    // Stable insertion sort matches the row-major 3x3 feature order used by
+    // Kornia's zero-padded convolution implementation.
+    for (int i = 1; i < 9; ++i) {
+        float value = values[i];
+        int source = sources[i];
+        int j = i;
+        while (j > 0 && values[j - 1] > value) {
+            values[j] = values[j - 1];
+            sources[j] = sources[j - 1];
+            --j;
+        }
+        values[j] = value;
+        sources[j] = source;
+    }
+    output[index] = values[4];
+    winner[index] = sources[4];
+}
+
+__global__ void median_blur_3x3_backward(
+        const float* grad_output, const int* winner, float* grad_input,
+        int count) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    int source = winner[index];
+    if (source >= 0) atomicAdd(grad_input + source, grad_output[index]);
+}
+'''
+
+
+class _MedianBlurDepth3x3(jt.Function):
+    """Kornia-compatible 3x3 median for a single float32 depth plane."""
+
+    def execute(self, depth):
+        if depth.ndim != 2 or depth.dtype != jt.float32:
+            raise ValueError(
+                f"median depth expects float32 [H,W], got {depth.dtype} {depth.shape}")
+        self.depth_shape = list(depth.shape)
+        height, width = map(int, depth.shape)
+        output = jt.zeros((height, width), dtype=jt.float32)
+        winner = jt.zeros((height, width), dtype=jt.int32)
+        output, winner = jt.code(
+            outputs=[output, winner],
+            inputs=[depth],
+            data={'H': height, 'W': width},
+            cuda_header=_MEDIAN_BLUR_CUDA_HEADER,
+            cuda_src=r'''
+@alias(input, in0) @alias(output, out0) @alias(winner, out1)
+int count = data["H"] * data["W"];
+median_blur_3x3_forward<<<(count + 255) / 256, 256>>>(
+    input_p, output_p, winner_p, data["H"], data["W"]);
+''',
+        )
+        self.winner = winner.stop_grad()
+        return output
+
+    def grad(self, grad_output):
+        count = int(self.depth_shape[0]) * int(self.depth_shape[1])
+        grad_input = jt.zeros(self.depth_shape, dtype=jt.float32)
+        (grad_input,) = jt.code(
+            outputs=[grad_input],
+            inputs=[grad_output, self.winner],
+            data={'COUNT': count},
+            cuda_header=_MEDIAN_BLUR_CUDA_HEADER,
+            cuda_src=r'''
+@alias(grad_output, in0) @alias(winner, in1) @alias(grad_input, out0)
+cudaMemset(grad_input_p, 0, (size_t)data["COUNT"] * sizeof(float));
+median_blur_3x3_backward<<<(data["COUNT"] + 255) / 256, 256>>>(
+    grad_output_p, winner_p, grad_input_p, data["COUNT"]);
+''',
+        )
+        self.winner = None
+        return grad_input
+
+
+def median_blur_depth_3x3(depth):
+    """Apply the source renderer's zero-padded 3x3 median to depth."""
+    if depth.ndim == 3:
+        if int(depth.shape[0]) != 1:
+            raise ValueError(f"depth channel count must be one, got {depth.shape}")
+        return _MedianBlurDepth3x3()(depth.squeeze(0)).unsqueeze(0)
+    if depth.ndim == 2:
+        return _MedianBlurDepth3x3()(depth)
+    raise ValueError(f"depth must have shape [H,W] or [1,H,W], got {depth.shape}")
 
 class _surface_align(jt.Function):
 
     def save_for_backward(self, *args):
         self.saved_tensors = args
 
+    @staticmethod
+    def _bucket_capacity(active_rows):
+        if active_rows <= 0:
+            raise ValueError("surface alignment requires at least one anchor")
+        return 1 << (int(active_rows) - 1).bit_length()
+
+    @staticmethod
+    def _pad_rows(value, target_rows):
+        current_rows = int(value.shape[0])
+        if current_rows == int(target_rows):
+            return value
+        if current_rows > int(target_rows):
+            raise ValueError("surface alignment padding target is too small")
+        shape = [int(target_rows) - current_rows, *value.shape[1:]]
+        return jt.concat([value, jt.zeros(shape, dtype=value.dtype)], dim=0)
+
     def execute(self, anchor, offsets_all, rotation, knn_index):
         """anchor (N,3), offsets_all (N*K,3), rotation (N*K,4), knn_index (N,K)"""
-        K = knn_index.shape[1]
+        active_rows = int(knn_index.shape[0])
+        K = int(knn_index.shape[1])
+        capacity_rows = self._bucket_capacity(active_rows)
+        active_offsets = active_rows * K
+        capacity_offsets = capacity_rows * K
+
+        # jt.code specializes on output shapes.  Visibility produces a new N
+        # for nearly every camera, while topology changes every 100 steps.
+        # Power-of-two capacity buckets keep the custom CUDA op shape stable;
+        # trailing rows are excluded from both returned losses and gradients.
+        padded_anchor = self._pad_rows(anchor, capacity_rows)
+        padded_offsets = self._pad_rows(offsets_all, capacity_offsets)
+        padded_rotation = self._pad_rows(rotation, capacity_offsets)
+        if capacity_rows == active_rows:
+            padded_knn = knn_index
+        else:
+            padding_knn = jt.arange(
+                active_offsets, capacity_offsets, dtype=jt.int32,
+            ).reshape(capacity_rows - active_rows, K)
+            padded_knn = jt.concat([knn_index, padding_knn], dim=0)
+
         from ..rasterize_points_jt import repeat_cuda
         with jt.no_grad():
-            repeat_anchor_all = repeat_cuda(anchor, K)       # (N,3) -> (N*K,3)
-        xyz_all = repeat_anchor_all + offsets_all            # (N*K,3)
+            repeat_anchor_all = repeat_cuda(padded_anchor, K)
+        xyz_all = repeat_anchor_all + padded_offsets
 
-        loss_d, loss_normal, binning_buffer, mean_d = SurfaceAlignCUDA(xyz_all, rotation, knn_index)
-        self.save_for_backward(anchor, offsets_all, rotation, binning_buffer, knn_index, mean_d)
-        return loss_d, loss_normal
+        loss_d, loss_normal, binning_buffer, mean_d = SurfaceAlignCUDA(
+            xyz_all, padded_rotation, padded_knn)
+        self.save_for_backward(
+            padded_anchor, padded_offsets, padded_rotation,
+            binning_buffer, padded_knn, mean_d,
+            active_rows, active_offsets,
+        )
+        return loss_d[:active_offsets], loss_normal[:active_offsets]
 
     def grad(self, grad_out_loss_d, grad_out_loss_normal):
-        anchor, offsets_all, rotation, binning_buffer, knn_index, mean_d = self.saved_tensors
-        K = knn_index.shape[1]
+        (anchor, offsets_all, rotation, binning_buffer, knn_index, mean_d,
+         active_rows, active_offsets) = self.saved_tensors
+        K = int(knn_index.shape[1])
+        capacity_offsets = int(offsets_all.shape[0])
 
         if grad_out_loss_d is None:
-            grad_out_loss_d = jt.zeros_like(mean_d)
+            grad_out_loss_d = jt.zeros([active_offsets], dtype=mean_d.dtype)
         if grad_out_loss_normal is None:
-            grad_out_loss_normal = jt.zeros_like(mean_d)
+            grad_out_loss_normal = jt.zeros(
+                [active_offsets], dtype=mean_d.dtype)
+        grad_out_loss_d = self._pad_rows(
+            grad_out_loss_d.reshape(-1, 1), capacity_offsets).reshape(-1)
+        grad_out_loss_normal = self._pad_rows(
+            grad_out_loss_normal.reshape(-1, 1), capacity_offsets).reshape(-1)
 
         from ..rasterize_points_jt import repeat_cuda, repeat_sum_bwd_cuda
         with jt.no_grad():
@@ -62,11 +213,17 @@ class _surface_align(jt.Function):
             xyz_all, rotation, mean_d, knn_index,
             grad_out_loss_d, grad_out_loss_normal)
 
-        grad_anchor = repeat_sum_bwd_cuda(grad_xyz, K)     # (N*K,3) -> (N,3)
+        grad_anchor = repeat_sum_bwd_cuda(grad_xyz, K)
 
-        # NOTE: do NOT set self.saved_tensors = None — retain_graph=True
-        # requires them for the second backward pass (optimizer.backward)
-        return grad_anchor, grad_xyz, grad_rotation, None
+        # Production performs one coordinated jt.grad. Release the graph-owned
+        # state after that backward so a completed step cannot retain its Vars.
+        self.saved_tensors = None
+        return (
+            grad_anchor[:active_rows],
+            grad_xyz[:active_offsets],
+            grad_rotation[:active_offsets],
+            None,
+        )
 
 
 class SurfaceAlign(nn.Module):
@@ -77,10 +234,6 @@ class SurfaceAlign(nn.Module):
     def execute(self, anchor, offsets_all, rotation, knn_index):
         return self.alignFunc(anchor, offsets_all, rotation, knn_index)
 
-
-def cpu_deep_copy_tuple(input_tuple):
-    copied_tensors = [item.clone() if isinstance(item, jt.Var) else item for item in input_tuple]
-    return tuple(copied_tensors)
 
 def rasterize_gaussians(
     means3D,
@@ -113,8 +266,7 @@ def rasterize_gaussians(
 
     focal_x = raster_settings.image_width / (2.0 * raster_settings.tanfovx)
     focal_y = raster_settings.image_height / (2.0 * raster_settings.tanfovy)
-    # TODO Phase 3: replace kornia.filters.median_blur with Jittor implementation
-    depth_filter = depth  # fallback: skip median blur until Phase 3
+    depth_filter = median_blur_depth_3x3(depth)
     normal_from_depth = depthToNormal(
         depth_filter.squeeze(0) if depth_filter.ndim == 3 else depth_filter,
         raster_settings.viewmatrix,
@@ -155,10 +307,9 @@ class _RasterizeGaussians(jt.Function):
                     sh, raster_settings.sh_degree, raster_settings.campos,
                     raster_settings.prefiltered, raster_settings.debug)
             except Exception as ex:
-                jt.save([means3D, colors_precomp, opacities, scales, rotations, extra_attrs,
-                         raster_settings.viewmatrix, raster_settings.projmatrix], "snapshot_fw.dump")
-                print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
-                raise ex
+                raise RuntimeError(
+                    "rasterizer forward failed in debug mode; legacy object "
+                    "snapshots are disabled, use the NPZ diagnostic exporter") from ex
         else:
             num_rendered, num_contrib, color, depth, opacity, norm, alpha, extra, radii, geomBuffer, binningBuffer, imgBuffer = RasterizeGaussiansCUDA(
                 raster_settings.bg, means3D, colors_precomp, opacities, scales, rotations,
@@ -171,6 +322,28 @@ class _RasterizeGaussians(jt.Function):
 
         self.raster_settings = raster_settings
         self.num_rendered = num_rendered
+        point_count = int(means3D.shape[0])
+        extra_dim = int(extra_attrs.shape[1]) if extra_attrs.ndim >= 2 and extra_attrs.shape[0] else 0
+        geom_bytes = int(geomBuffer.numel())
+        binning_bytes = int(binningBuffer.numel())
+        image_bytes = int(imgBuffer.numel())
+        self.runtime_stats = {
+            "P": point_count,
+            "R": int(num_rendered),
+            "ED": extra_dim,
+            "forward_buffer_bytes": {
+                "geometry": geom_bytes,
+                "binning": binning_bytes,
+                "image": image_bytes,
+                "total": geom_bytes + binning_bytes + image_bytes,
+            },
+            "backward_estimated_bytes": {
+                "fp64_accumulators": 8 * point_count * (15 + extra_dim),
+                "mean_conic_partials": 8 * int(num_rendered) * 5,
+                "second_sort_keys": 8 * int(num_rendered) * 2,
+                "cub_sort_scratch": None,
+            },
+        }
         self.save_for_backward(colors_precomp, means3D, scales, rotations,
                                cov3Ds_precomp, norm3Ds_precomp, radii, extra_attrs,
                                sh, geomBuffer, binningBuffer, imgBuffer, alpha)
@@ -207,11 +380,9 @@ class _RasterizeGaussians(jt.Function):
                     sh, raster_settings.sh_degree, raster_settings.campos,
                     geomBuffer, num_rendered, binningBuffer, imgBuffer, alpha, raster_settings.debug)
             except Exception as ex:
-                jt.save([raster_settings.bg, means3D, radii, colors_precomp, scales, rotations, extra_attrs,
-                         raster_settings.viewmatrix, raster_settings.projmatrix,
-                         grad_out_color, grad_out_depth, grad_out_norm, grad_out_alpha, grad_out_extra], "snapshot_bw.dump")
-                print("\nAn error occured in backward. Writing snapshot_bw.dump for debugging.\n")
-                raise ex
+                raise RuntimeError(
+                    "rasterizer backward failed in debug mode; legacy object "
+                    "snapshots are disabled, use the NPZ diagnostic exporter") from ex
         else:
             grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_norm3Ds_precomp, grad_sh, grad_scales, grad_rotations, grad_extra_attrs = RasterizeGaussiansBackwardCUDA(
                 raster_settings.bg, means3D, radii, colors_precomp, scales, rotations, extra_attrs,
@@ -222,9 +393,7 @@ class _RasterizeGaussians(jt.Function):
                 sh, raster_settings.sh_degree, raster_settings.campos,
                 geomBuffer, num_rendered, binningBuffer, imgBuffer, alpha, raster_settings.debug)
 
-        # NOTE: do NOT set self.saved_tensors = None — retain_graph=True
-        # requires them for the second backward pass (optimizer.backward)
-        return (
+        gradients = (
             grad_means3D,         # means3D
             grad_means2D,         # means2D
             grad_sh,              # sh
@@ -237,6 +406,11 @@ class _RasterizeGaussians(jt.Function):
             grad_extra_attrs,     # extra_attrs
             None                  # raster_settings
         )
+        # The production coordinator calls jt.grad exactly once.  Native
+        # reverse outputs are synchronized before returning, so the large
+        # Geometry/Binning/Image buffers no longer need Python ownership.
+        del self.saved_tensors
+        return gradients
 
 class GaussianRasterizationSettings(NamedTuple):
     image_height: int
@@ -316,7 +490,7 @@ class GaussianRasterizer(nn.Module):
             norm = jt.normalize(norm, p=2, dim=0)
             focal_x = raster_settings.image_width / (2.0 * raster_settings.tanfovx)
             focal_y = raster_settings.image_height / (2.0 * raster_settings.tanfovy)
-            depth_filter = depth
+            depth_filter = median_blur_depth_3x3(depth)
             normal_from_depth = depthToNormal(
                 depth_filter.squeeze(0) if depth_filter.ndim == 3 else depth_filter,
                 raster_settings.viewmatrix,
@@ -360,13 +534,9 @@ class GaussianRasterizer(nn.Module):
             norm3Ds_precomp = jt.array([])
         if extra_attrs is None:
             extra_attrs = jt.array([])
-        # Store rasterizer inputs for manual gradient computation (Phase 22)
-        self._last_scales_input = scales
-        self._last_rotations_input = rotations
-        self._last_means3D_input = means3D
-        self._last_opacities_input = opacities
-        # Manual instance creation: keep reference for saved_tensors access
-        self._last_rasterize_func = _RasterizeGaussians()
+        # Keep the Function instance owned by this module while Jittor's tape is
+        # live.  The backward callback releases its saved tensors immediately.
+        self._last_rasterize_func = self._rasterize_func
         num_contrib, color, depth, opacity, norm, alpha, radii, extra = \
             self._last_rasterize_func(
                 means3D,
@@ -386,7 +556,7 @@ class GaussianRasterizer(nn.Module):
         norm = jt.normalize(norm, p=2, dim=0)
         focal_x = raster_settings.image_width / (2.0 * raster_settings.tanfovx)
         focal_y = raster_settings.image_height / (2.0 * raster_settings.tanfovy)
-        depth_filter = depth
+        depth_filter = median_blur_depth_3x3(depth)
         normal_from_depth = depthToNormal(
             depth_filter.squeeze(0) if depth_filter.ndim == 3 else depth_filter,
             raster_settings.viewmatrix,

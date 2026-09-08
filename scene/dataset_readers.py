@@ -30,12 +30,43 @@ from scene.gaussian_model import BasicPointCloud
 
 try:
     import laspy
-except:
+except ImportError:
     print("No laspy")
 
 
 
 from scene.utils import load_img_rgb, load_mask_bool, load_depth, load_pfm
+
+
+def _material_metadata_path(directory, image_name):
+    """Prefer safe NPZ metadata and retain non-object NPY compatibility."""
+    base = Path(directory) / "RGB_X" / image_name
+    npz_path = base.with_suffix(".npz")
+    return npz_path if npz_path.is_file() else base.with_suffix(".npy")
+
+
+def _load_material_metadata(path):
+    """Load material metadata without executing pickled Python objects."""
+    path = Path(path)
+    try:
+        loaded = np.load(path, allow_pickle=False)
+    except ValueError as exc:
+        raise ValueError(
+            f"unsafe object-array material metadata is not accepted: {path}; "
+            "convert it to an NPZ file with named numeric arrays"
+        ) from exc
+    if isinstance(loaded, np.lib.npyio.NpzFile):
+        try:
+            result = {name: np.asarray(loaded[name]) for name in loaded.files}
+        finally:
+            loaded.close()
+        return result
+    array = np.asarray(loaded)
+    if array.dtype.names and array.shape in {(), (1,)}:
+        scalar = array.reshape(-1)[0]
+        return {name: np.asarray(scalar[name]) for name in array.dtype.names}
+    raise ValueError(
+        f"material metadata must be NPZ named arrays or a structured scalar: {path}")
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -121,13 +152,15 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image = Image.open(image_path)
 
 
-        meta_path = os.path.join(os.path.dirname(images_folder),"RGB_X", f"{image_name}.npy")
+        meta_path = _material_metadata_path(os.path.dirname(images_folder), image_name)
+        normal = None
         if os.path.exists(meta_path):
-            meta_all = np.load(meta_path, allow_pickle=True)
-            albedo = meta_all.item()['albedo']
-            roughness = meta_all.item()["roughness"]
-            metallic = meta_all.item()["metallic"] 
-            irradiance = meta_all.item()["irradiance"]
+            meta_all = _load_material_metadata(meta_path)
+            albedo = meta_all['albedo']
+            normal = meta_all.get("normal")
+            roughness = meta_all["roughness"]
+            metallic = meta_all["metallic"]
+            irradiance = meta_all["irradiance"]
         else:
             albedo = roughness = metallic = irradiance = normal = None
 
@@ -223,16 +256,19 @@ def storePly(path, xyz, rgb):
     ply_data.write(path)
 
 def readColmapSceneInfo(path, images, eval, ds, llffhold=8):
-    try:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
+    cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
+    cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
+    cameras_extrinsic_text = os.path.join(path, "sparse/0", "images.txt")
+    cameras_intrinsic_text = os.path.join(path, "sparse/0", "cameras.txt")
+    if os.path.isfile(cameras_extrinsic_file) and os.path.isfile(cameras_intrinsic_file):
         cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
-    except:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
-        cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
-        cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+    elif os.path.isfile(cameras_extrinsic_text) and os.path.isfile(cameras_intrinsic_text):
+        cam_extrinsics = read_extrinsics_text(cameras_extrinsic_text)
+        cam_intrinsics = read_intrinsics_text(cameras_intrinsic_text)
+    else:
+        raise FileNotFoundError(
+            "COLMAP cameras require a complete images/cameras .bin pair or .txt pair")
 
     reading_dir = "images" if ds == 1 else f"images_{ds}"
     cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
@@ -253,10 +289,12 @@ def readColmapSceneInfo(path, images, eval, ds, llffhold=8):
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-        try:
+        if os.path.isfile(bin_path):
             xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
+        elif os.path.isfile(txt_path):
             xyz, rgb, _ = read_points3D_text(txt_path)
+        else:
+            raise FileNotFoundError("COLMAP point cloud is missing points3D.bin and points3D.txt")
         storePly(ply_path, xyz, rgb)
     # try:
     print(f'start fetching data from ply file')
@@ -300,14 +338,14 @@ def readCamerasFromTransforms3(path, transformsfile, white_background, extension
 
             fovy = focal2fov(fov2focal(fovx, image.shape[0]), image.shape[1])
             
-            meta_path = os.path.join(path, "RGB_X", f"{image_name}.npy")
+            meta_path = _material_metadata_path(path, image_name)
             if is_train and os.path.exists(meta_path):
-                meta_all = np.load(meta_path, allow_pickle=True)
-                albedo = meta_all.item()['albedo']
-                normal = meta_all.item()["normal"]
-                roughness = meta_all.item()["roughness"]
-                metallic = meta_all.item()["metallic"] 
-                irradiance = meta_all.item()["irradiance"]
+                meta_all = _load_material_metadata(meta_path)
+                albedo = meta_all['albedo']
+                normal = meta_all["normal"]
+                roughness = meta_all["roughness"]
+                metallic = meta_all["metallic"]
+                irradiance = meta_all["irradiance"]
             else:
                 normal=albedo=roughness=metallic=irradiance=None
 
@@ -392,17 +430,17 @@ def readCamerasFromTransforms4(path, transformsfile, white_background, extension
             norm_data = im_data / 255.0
             arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
             mask = norm_data[:, :, 3:4][:,:,0]
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+            image = Image.fromarray(np.array(arr * 255.0, dtype=np.uint8), "RGB")
             
             fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            meta_path = os.path.join(path, "RGB_X", f"{image_name}.npy")
+            meta_path = _material_metadata_path(path, image_name)
             if is_train and os.path.exists(meta_path):
-                meta_all = np.load(meta_path, allow_pickle=True)
-                albedo = meta_all.item()['albedo']
-                normal = meta_all.item()["normal"]
-                roughness = meta_all.item()["roughness"]
-                metallic = meta_all.item()["metallic"] 
-                irradiance = meta_all.item()["irradiance"]
+                meta_all = _load_material_metadata(meta_path)
+                albedo = meta_all['albedo']
+                normal = meta_all["normal"]
+                roughness = meta_all["roughness"]
+                metallic = meta_all["metallic"]
+                irradiance = meta_all["irradiance"]
             else:
                 normal=albedo=roughness=metallic=irradiance=None
 

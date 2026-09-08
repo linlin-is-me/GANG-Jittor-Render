@@ -502,6 +502,65 @@ __global__ void preprocessCUDA(
   
 }
 
+// Reduce the 32 pixel contributions in a fixed lane order before the warp
+// leader touches the cross-pixel accumulator.
+__device__ __forceinline__ void warpReducedAtomicAdd(double* address, double value)
+{
+  constexpr unsigned FULL_MASK = 0xffffffffu;
+  for (int offset = 16; offset > 0; offset >>= 1)
+    value += __shfl_down_sync(FULL_MASK, value, offset);
+  const int linear_thread = threadIdx.y * blockDim.x + threadIdx.x;
+  if ((linear_thread & 31) == 0)
+    atomicAdd(address, value);
+}
+
+// Each tile block visits one Gaussian occurrence at a time.  Reduce the five
+// mean/conic contributions in a fixed lane, warp and component order, then
+// store one partial at that occurrence's unique index.  A later kernel groups
+// these partials by Gaussian; no scheduler-ordered atomic participates in the
+// high-condition-number covariance path.
+__device__ __forceinline__ void blockStoreMeanConicPartials(
+  double mean_x, double mean_y, double conic_x, double conic_y, double conic_w,
+  const uint32_t occurrence, double* partials, double* scratch)
+{
+  constexpr unsigned FULL_MASK = 0xffffffffu;
+  for (int offset = 16; offset > 0; offset >>= 1)
+  {
+    mean_x += __shfl_down_sync(FULL_MASK, mean_x, offset);
+    mean_y += __shfl_down_sync(FULL_MASK, mean_y, offset);
+    conic_x += __shfl_down_sync(FULL_MASK, conic_x, offset);
+    conic_y += __shfl_down_sync(FULL_MASK, conic_y, offset);
+    conic_w += __shfl_down_sync(FULL_MASK, conic_w, offset);
+  }
+  const int thread = threadIdx.y * blockDim.x + threadIdx.x;
+  const int lane = thread & 31;
+  const int warp = thread >> 5;
+  if (lane == 0)
+  {
+    double* warp_values = scratch + warp * 5;
+    warp_values[0] = mean_x;
+    warp_values[1] = mean_y;
+    warp_values[2] = conic_x;
+    warp_values[3] = conic_y;
+    warp_values[4] = conic_w;
+  }
+  __syncthreads();
+  if (thread == 0)
+  {
+    double* output = partials + (size_t)occurrence * 5;
+    #pragma unroll
+    for (int component = 0; component < 5; ++component)
+    {
+      double sum = 0.0;
+      #pragma unroll
+      for (int source_warp = 0; source_warp < BLOCK_SIZE / 32; ++source_warp)
+        sum += scratch[source_warp * 5 + component];
+      output[component] = sum;
+    }
+  }
+  __syncthreads();
+}
+
 // Backward version of the rendering procedure.
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
@@ -523,13 +582,14 @@ renderCUDA(
   const float* __restrict__ dL_dpixel_norms,
   const float* __restrict__ dL_dpixel_alphas,
   const float* __restrict__ dL_dpixel_extras,
-  float3* __restrict__ dL_dmean2D,
-  float4* __restrict__ dL_dconic2D,
-  float* __restrict__ dL_dopacity,
-  float* __restrict__ dL_dcolors,
-  float* __restrict__ dL_ddepths,
-  float* __restrict__ dL_dnorm3Ds,
-  float* __restrict__ dL_dextras)
+  double* __restrict__ dL_dmean2D,
+  double* __restrict__ dL_dconic2D,
+  double* __restrict__ dL_dopacity,
+  double* __restrict__ dL_dcolors,
+  double* __restrict__ dL_ddepths,
+  double* __restrict__ dL_dnorm3Ds,
+  double* __restrict__ dL_dextras,
+  double* __restrict__ mean_conic_partials)
 {
   // We rasterize again. Compute necessary block info.
   auto block = cg::this_thread_block();
@@ -555,6 +615,11 @@ renderCUDA(
   __shared__ float collected_depths[BLOCK_SIZE];
   __shared__ float collected_norms[3 * BLOCK_SIZE];
   __shared__ float collected_extras[MAX_EXTRA_DIMS * BLOCK_SIZE];
+  // The other shared arrays consume exactly 48 KiB when MAX_EXTRA_DIMS is 36.
+  // Keep the deterministic FP64 reduction scratch in opt-in dynamic shared
+  // memory so CUDA toolkits which enforce the 48 KiB static limit can compile
+  // the kernel without changing the reduction order or precision.
+  extern __shared__ double mean_conic_scratch[];
 
   // In the forward, we stored the final value for T, the
   // product of all (1 - alpha) factors. 
@@ -624,31 +689,31 @@ renderCUDA(
     block.sync();
 
     // Iterate over Gaussians
-    for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+    for (int j = 0; j < min(BLOCK_SIZE, toDo); j++)
     {
       // Keep track of current Gaussian ID. Skip, if this one
       // is behind the last contributor for this pixel.
       contributor--;
-      if (contributor >= last_contributor)
-        continue;
+      bool active = !done && contributor < last_contributor;
 
       // Compute blending values, as before.
       const float2 xy = collected_xy[j];
       const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
       const float4 con_o = collected_conic_opacity[j];
       const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
-      if (power > 0.0f)
-        continue;
+      active = active && power <= 0.0f;
+      const float G = active ? exp(power) : 0.0f;
+      const float alpha = active ? min(0.99f, con_o.w * G) : 0.0f;
+      active = active && alpha >= 1.0f / 255.0f;
 
-      const float G = exp(power);
-      const float alpha = min(0.99f, con_o.w * G);
-      if (alpha < 1.0f / 255.0f)
-        continue;
-
-      T = T / (1.f - alpha);
-      // Guard: clamp T overflow from repeated division by small (1-alpha)
-      if (T > 1e4f || T != T) T = 0.0f;
-      const float weight = alpha * T;
+      float weight = 0.0f;
+      if (active)
+      {
+        T = T / (1.f - alpha);
+        // Guard: clamp T overflow from repeated division by small (1-alpha)
+        if (T > 1e4f || T != T) T = 0.0f;
+        weight = alpha * T;
+      }
       // const float dchannel_dcolor = alpha * T;
       // const float dpixel_depth_ddepth = alpha * T;
       // const float dpixel_norm_dnorm = alpha * T;
@@ -661,93 +726,90 @@ renderCUDA(
       const int global_id = collected_id[j];
       for (int ch = 0; ch < C; ch++)
       {
-        const float c = collected_colors[ch * BLOCK_SIZE + j];
-        // Update last color (to be used in the next iteration)
-        accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-        last_color[ch] = c;
-
-        const float dL_dchannel = dL_dpixel[ch];
-        dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
-        // Update the gradients w.r.t. color of the Gaussian. 
-        // Atomic, since this pixel is just one of potentially
-        // many that were affected by this Gaussian.
-        atomicAdd(&(dL_dcolors[global_id * C + ch]), weight * dL_dchannel);
+        double contribution = 0.0;
+        if (active)
+        {
+          const float c = collected_colors[ch * BLOCK_SIZE + j];
+          accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+          last_color[ch] = c;
+          const float dL_dchannel = dL_dpixel[ch];
+          dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+          contribution = (double)(weight * dL_dchannel);
+        }
+        warpReducedAtomicAdd(&(dL_dcolors[global_id * C + ch]), contribution);
       }
-      const float dep = collected_depths[j];
-      accum_red = last_alpha * last_depth + (1.f - last_alpha) * accum_red;
-      last_depth = dep;
-      dL_dalpha += (dep-accum_red) * dL_dpixel_depth;
-      atomicAdd(&(dL_ddepths[global_id]), weight * dL_dpixel_depth);
+      double depth_contribution = 0.0;
+      if (active)
+      {
+        const float dep = collected_depths[j];
+        accum_red = last_alpha * last_depth + (1.f - last_alpha) * accum_red;
+        last_depth = dep;
+        dL_dalpha += (dep-accum_red) * dL_dpixel_depth;
+        depth_contribution = (double)(weight * dL_dpixel_depth);
+      }
+      warpReducedAtomicAdd(&(dL_ddepths[global_id]), depth_contribution);
       
       for (int ch = 0; ch < 3; ch++)
       {
-        const float n = collected_norms[ch * BLOCK_SIZE + j];
-        // Update last norm (to be used in the next iteration)
-        accum_ren[ch] = last_alpha * last_norm[ch] + (1.f - last_alpha) * accum_ren[ch];
-        last_norm[ch] = n;
-
-        const float dL_dnormch = dL_dpixel_norm[ch];
-        dL_dalpha += (n - accum_ren[ch]) * dL_dnormch;
-        // Update the gradients w.r.t. norm of the Gaussian. 
-        // Atomic, since this pixel is just one of potentially
-        // many that were affected by this Gaussian.
-        atomicAdd(&(dL_dnorm3Ds[global_id * 3 + ch]), weight * dL_dnormch);
+        double contribution = 0.0;
+        if (active)
+        {
+          const float n = collected_norms[ch * BLOCK_SIZE + j];
+          accum_ren[ch] = last_alpha * last_norm[ch] + (1.f - last_alpha) * accum_ren[ch];
+          last_norm[ch] = n;
+          const float dL_dnormch = dL_dpixel_norm[ch];
+          dL_dalpha += (n - accum_ren[ch]) * dL_dnormch;
+          contribution = (double)(weight * dL_dnormch);
+        }
+        warpReducedAtomicAdd(&(dL_dnorm3Ds[global_id * 3 + ch]), contribution);
       }
 
       for (int ch = 0; ch < ED; ch++)
       {
-        const float e = collected_extras[ch * BLOCK_SIZE + j];
-        // Update last norm (to be used in the next iteration)
-        accum_ree[ch] = last_alpha * last_extra[ch] + (1.f - last_alpha) * accum_ree[ch];
-        last_extra[ch] = e;
-
-        const float dL_dextrach = dL_dpixel_extra[ch];
-        dL_dalpha += (e - accum_ree[ch]) * dL_dextrach;
-        // Update the gradients w.r.t. norm of the Gaussian. 
-        // Atomic, since this pixel is just one of potentially
-        // many that were affected by this Gaussian.
-        atomicAdd(&(dL_dextras[global_id * ED + ch]), weight * dL_dextrach);
+        double contribution = 0.0;
+        if (active)
+        {
+          const float e = collected_extras[ch * BLOCK_SIZE + j];
+          accum_ree[ch] = last_alpha * last_extra[ch] + (1.f - last_alpha) * accum_ree[ch];
+          last_extra[ch] = e;
+          const float dL_dextrach = dL_dpixel_extra[ch];
+          dL_dalpha += (e - accum_ree[ch]) * dL_dextrach;
+          contribution = (double)(weight * dL_dextrach);
+        }
+        warpReducedAtomicAdd(&(dL_dextras[global_id * ED + ch]), contribution);
       }
 
-      accum_rea = last_alpha + (1.f - last_alpha) * accum_rea;
-      dL_dalpha += (1 - accum_rea) * dL_dpixel_alpha;
-
-
-      dL_dalpha *= T;
-	      // Clamp: prevent dL_dalpha overflow from large T amplifying
-	      // per-channel contributions. Bounds downstream dL_dG, dL_dmean2D, dL_dconic.
-	      dL_dalpha = fminf(fmaxf(dL_dalpha, -1e6f), 1e6f);
-      // Update last alpha (to be used in the next iteration)
-      last_alpha = alpha;
-
-      // Account for fact that alpha also influences how much of
-      // the background color is added if nothing left to blend
-      float bg_dot_dpixel = 0;
-      for (int i = 0; i < C; i++)
-        bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
-      dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
-
-      // Set background depth value == 0, thus no contribution for
-      // dL_dalpha
-
-      // Helpful reusable temporary variables
-      const float dL_dG = con_o.w * dL_dalpha;
-      const float gdx = G * d.x;
-      const float gdy = G * d.y;
-      const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-      const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
-
-      // Update gradients w.r.t. 2D mean position of the Gaussian
-      atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-      atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
-
-      // Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-      atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
-      atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
-      atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
-
-      // Update gradients w.r.t. opacity of the Gaussian
-      atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+      double mean_x = 0.0, mean_y = 0.0;
+      double conic_x = 0.0, conic_y = 0.0, conic_w = 0.0;
+      double opacity_contribution = 0.0;
+      if (active)
+      {
+        accum_rea = last_alpha + (1.f - last_alpha) * accum_rea;
+        dL_dalpha += (1 - accum_rea) * dL_dpixel_alpha;
+        dL_dalpha *= T;
+        dL_dalpha = fminf(fmaxf(dL_dalpha, -1e6f), 1e6f);
+        last_alpha = alpha;
+        float bg_dot_dpixel = 0;
+        for (int channel = 0; channel < C; channel++)
+          bg_dot_dpixel += bg_color[channel] * dL_dpixel[channel];
+        dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+        const float dL_dG = con_o.w * dL_dalpha;
+        const float gdx = G * d.x;
+        const float gdy = G * d.y;
+        const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+        const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+        mean_x = (double)(dL_dG * dG_ddelx * ddelx_dx);
+        mean_y = (double)(dL_dG * dG_ddely * ddely_dy);
+        conic_x = (double)(-0.5f * gdx * d.x * dL_dG);
+        conic_y = (double)(-0.5f * gdx * d.y * dL_dG);
+        conic_w = (double)(-0.5f * gdy * d.y * dL_dG);
+        opacity_contribution = (double)(G * dL_dalpha);
+      }
+      const uint32_t occurrence = range.y - (i * BLOCK_SIZE + j) - 1;
+      blockStoreMeanConicPartials(
+        mean_x, mean_y, conic_x, conic_y, conic_w,
+        occurrence, mean_conic_partials, mean_conic_scratch);
+      warpReducedAtomicAdd(&(dL_dopacity[global_id]), opacity_contribution);
     }
   }
 }
@@ -845,15 +907,29 @@ void BACKWARD::render(
   const float* dL_dpixel_norms,
   const float* dL_dpixel_alphas,
   const float* dL_dpixel_extras,
-  float3* dL_dmean2D,
-  float4* dL_dconic2D,
-  float* dL_dopacity,
-  float* dL_dcolors,
-  float* dL_ddepths,
-  float* dL_dnorm3Ds,
-  float* dL_dextras)
+  double* dL_dmean2D,
+  double* dL_dconic2D,
+  double* dL_dopacity,
+  double* dL_dcolors,
+  double* dL_ddepths,
+  double* dL_dnorm3Ds,
+  double* dL_dextras,
+  double* mean_conic_partials)
 {
-  renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+  constexpr int scratch_bytes =
+    static_cast<int>(sizeof(double) * (BLOCK_SIZE / 32) * 5);
+  const cudaError_t attribute_status = cudaFuncSetAttribute(
+    renderCUDA<NUM_CHANNELS>,
+    cudaFuncAttributeMaxDynamicSharedMemorySize,
+    scratch_bytes);
+  if (attribute_status != cudaSuccess)
+  {
+    fprintf(stderr,
+      "Failed to enable raster backward dynamic shared memory: %s\n",
+      cudaGetErrorString(attribute_status));
+    return;
+  }
+  renderCUDA<NUM_CHANNELS> << <grid, block, scratch_bytes >> >(
     ranges,
     point_list,
     W, H, ED,
@@ -877,5 +953,6 @@ void BACKWARD::render(
     dL_dcolors,
     dL_ddepths,
     dL_dnorm3Ds,
-    dL_dextras);
+    dL_dextras,
+    mean_conic_partials);
 }

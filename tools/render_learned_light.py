@@ -141,7 +141,8 @@ def main():
                       lp.add_level, lp.visible_threshold, lp.dist2level,
                       lp.base_layer, lp.progressive, lp.extend,
                       is_pbr=True, normal_detal=False, with_matallic=True)
-    g.restore_numpy(model_args, metadata=meta)
+    g.restore_numpy(model_args, metadata=meta, inference_only=True, build_optimizer=False)
+    g._offset = g._offset.reshape((-1, 3))
     g.eval()
     N = g.get_anchor.shape[0]
     print(f"[restore] anchors={N}")

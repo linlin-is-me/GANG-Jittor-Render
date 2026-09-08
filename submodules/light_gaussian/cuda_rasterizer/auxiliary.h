@@ -14,6 +14,8 @@
 
 #include "config.h"
 #include "stdio.h"
+#include <iostream>
+#include <stdexcept>
 
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
 #define NUM_WARPS (BLOCK_SIZE/32)
@@ -164,13 +166,22 @@ __forceinline__ __device__ bool in_frustum(int idx,
   return true;
 }
 
-#define CHECK_CUDA(A, debug) \
-A; if(debug) { \
-auto ret = cudaDeviceSynchronize(); \
-if (ret != cudaSuccess) { \
-std::cerr << "\n[CUDA ERROR] in " << __FILE__ << "\nLine " << __LINE__ << ": " << cudaGetErrorString(ret); \
-throw std::runtime_error(cudaGetErrorString(ret)); \
+#define CHECK_CUDA(A, debug) do { \
+A; \
+auto gang_cuda_call_status = cudaGetLastError(); \
+if (gang_cuda_call_status != cudaSuccess) { \
+std::cerr << "\n[CUDA ERROR] in " << __FILE__ << "\nLine " << __LINE__ \
+          << " after " << #A << ": " << cudaGetErrorString(gang_cuda_call_status); \
+throw std::runtime_error(cudaGetErrorString(gang_cuda_call_status)); \
 } \
-}
+if(debug) { \
+auto gang_cuda_sync_status = cudaDeviceSynchronize(); \
+if (gang_cuda_sync_status != cudaSuccess) { \
+std::cerr << "\n[CUDA ERROR] in " << __FILE__ << "\nLine " << __LINE__ \
+          << " after synchronize: " << cudaGetErrorString(gang_cuda_sync_status); \
+throw std::runtime_error(cudaGetErrorString(gang_cuda_sync_status)); \
+} \
+} \
+} while(false);
 
 #endif

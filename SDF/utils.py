@@ -2,8 +2,8 @@ import jittor as jt
 import numpy as np
 
 
-def spec_gaussian_filter(res, sig):
-    omega = fftfreqs(res, dtype=jt.float64) # [dim0, dim1, dim2, d]
+def spec_gaussian_filter(res, sig, full_spectrum=False):
+    omega = fftfreqs(res, dtype=jt.float64, full_spectrum=full_spectrum) # [dim0, dim1, dim2, d]
     dis = jt.sqrt(jt.sum(omega ** 2, dim=-1))
     filter_ = jt.exp(-0.5*((sig*2*dis/res[0])**2)).unsqueeze(-1).unsqueeze(-1)
     filter_.requires_grad = False
@@ -11,7 +11,7 @@ def spec_gaussian_filter(res, sig):
     return filter_
 
 
-def fftfreqs(res, dtype=jt.float32, exact=True):
+def fftfreqs(res, dtype=jt.float32, exact=True, full_spectrum=False):
     """
     Helper function to return frequency tensors
     :param res: n_dims int tuple of number of frequency modes
@@ -25,7 +25,15 @@ def fftfreqs(res, dtype=jt.float32, exact=True):
         freq = np.fft.fftfreq(r_, d=1/r_)
         freqs.append(jt.array(freq, dtype=dtype))
     r_ = res[-1]
-    if exact:
+    if full_spectrum:
+        last_freq = np.fft.fftfreq(r_, d=1/r_)
+        # torch.fft.rfftfreq represents the self-conjugate Nyquist bin as
+        # positive for even sizes.  DPSR's PyTorch reference uses that
+        # convention, so preserve it when expanding to a full spectrum.
+        if r_ % 2 == 0:
+            last_freq[r_ // 2] = abs(last_freq[r_ // 2])
+        freqs.append(jt.array(last_freq, dtype=dtype))
+    elif exact:
         freqs.append(jt.array(np.fft.rfftfreq(r_, d=1/r_), dtype=dtype))
     else:
         freqs.append(jt.array(np.fft.rfftfreq(r_, d=1/r_)[:-1], dtype=dtype))
@@ -93,7 +101,15 @@ def grid_interp(grid, pts, batched=True):
     pos_ = xyz01[1 - com_, ..., dim_].permute(2, 3, 0, 1)  # (batch, num_points, 2**dim, dim)
     pos_ = pos_.float32()
     dxyz_ = jt.abs(pts.unsqueeze(-2) - pos_) / cubesize  # (batch, num_points, 2**dim, dim)
-    weights = jt.prod(dxyz_, dim=-1, keepdim=False)  # (batch, num_points, 2**dim)
+    # Jittor 1.3.11's generic prod backward divides the full product by each
+    # factor.  At an exact voxel boundary one factor is zero, producing 0/0
+    # even though the trilinear derivative is finite.  DPSR is three
+    # dimensional, so write the equivalent product explicitly; autograd then
+    # applies the product rule without division.
+    if dim == 3:
+        weights = dxyz_[..., 0] * dxyz_[..., 1] * dxyz_[..., 2]
+    else:
+        weights = jt.prod(dxyz_, dim=-1, keepdim=False)
     query_values = jt.sum(lat * weights.unsqueeze(-1), dim=-2)  # (batch, num_points, in_features)
     if not batched:
         query_values = query_values.squeeze(0)
@@ -160,7 +176,10 @@ def point_rasterize(pts, vals, size):
     pos_ = xyz01[1 - com_, ..., dim_].permute(2, 3, 0, 1)  # (batch, num_points, 2**dim, dim)
     pos_ = pos_.float32()
     dxyz_ = jt.abs(pts.unsqueeze(-2) - pos_) / cubesize  # (batch, num_points, 2**dim, dim)
-    weights = jt.prod(dxyz_, dim=-1, keepdim=False)  # (batch, num_points, 2**dim)
+    if dim == 3:
+        weights = dxyz_[..., 0] * dxyz_[..., 1] * dxyz_[..., 2]
+    else:
+        weights = jt.prod(dxyz_, dim=-1, keepdim=False)
 
     ind_b = ind_b.unsqueeze(-1).unsqueeze(-1)  # (batch, num_points, 2**dim, 1, 1)
     ind_n = ind_n.unsqueeze(-2)  # (batch, num_points, 2**dim, 1, dim)

@@ -1,0 +1,325 @@
+{
+  "method": "direct text comparison to transfer archives; normalized line endings and final newline; no new hashes",
+  "all_selected_sources_match": true,
+  "file_count": 509,
+  "files": [
+    {
+      "path": "SDF/__init__.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "SDF/dpsr.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "SDF/fft3d.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "SDF/network.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "SDF/utils.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "arguments/__init__.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "gaussian_renderer/__init__.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "gaussian_renderer/cuda_include_compat/nvrtc_device_runtime.h",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "gaussian_renderer/simple_knn_jt.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "gaussian_renderer/simple_knn_v2_op.cc",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "gaussian_renderer/simple_knn_v2_op.h",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/NVDIFFREC/__init__.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/NVDIFFREC/irrmaps/README.txt",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/NVDIFFREC/irrmaps/bsdf_256_256.bin",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/NVDIFFREC/light.py",
+      "archive": "sg-vector3-r4.tar"
+    },
+    {
+      "path": "scene/NVDIFFREC/renderutils/__init__.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/NVDIFFREC/renderutils/bsdf.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/NVDIFFREC/renderutils/cubemap_ops.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/NVDIFFREC/renderutils/jittor_ops.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/NVDIFFREC/renderutils/loss.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/NVDIFFREC/sg_vector3.py",
+      "archive": "sg-vector3-r4.tar"
+    },
+    {
+      "path": "scene/NVDIFFREC/texture/CMakeLists.txt",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/NVDIFFREC/texture/__init__.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/NVDIFFREC/texture/jittor_texture.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/NVDIFFREC/util.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/__init__.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/cameras.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/colmap_loader.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/dataset_readers.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/embedding.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/gaussian_model.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "scene/utils.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/CMakeLists.txt",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/__init__.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/_rebuild.sh",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/cuda_rasterizer/auxiliary.h",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/cuda_rasterizer/backward.cu",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/cuda_rasterizer/backward.h",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/cuda_rasterizer/config.h",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/cuda_rasterizer/forward.cu",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/cuda_rasterizer/forward.h",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/cuda_rasterizer/rasterizer.h",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/cuda_rasterizer/rasterizer_impl.cu",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/cuda_rasterizer/rasterizer_impl.h",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/cuda_rasterizer/vec_math.h",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/ext.cpp",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/light_gaussian/__init__.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/rasterize_points.cu",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/rasterize_points.h",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/rasterize_points_jt.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/rasterizer_provenance.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/setup.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/surface_align.cu",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "submodules/light_gaussian/surface_align.h",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "tools/benchmark_inference_versions.py",
+      "archive": "supplement-res4-input.tar"
+    },
+    {
+      "path": "tools/compare_inference_benchmarks.py",
+      "archive": "inference-comparison-20260907-r2/benchmark_adapter.tar"
+    },
+    {
+      "path": "tools/inference_named_checkpoint.py",
+      "archive": "inference-comparison-20260907-r2/benchmark_adapter.tar"
+    },
+    {
+      "path": "tools/inference_raster_benchmark.py",
+      "archive": "inference-three-modes-tools.tar"
+    },
+    {
+      "path": "tools/summarize_inference_three_modes.py",
+      "archive": "optimized-pair-r1.tar"
+    },
+    {
+      "path": "tools/test_inference_benchmark.py",
+      "archive": "inference-three-modes-tools-v2.tar"
+    },
+    {
+      "path": "tools/write_rasterizer_manifest.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/__init__.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/abledo_adjust.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/camera_utils.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/cuda_utils.cu",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/cuda_utils.h",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/emitter_sampling.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/ext.cpp",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/general_utils.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/graphics_utils.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/image_utils.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/jt_safe.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/kornia_ops_jt.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/light_utils.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/loss_utils.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/receiver_query.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/sh_utils.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/shadow_bounds.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    },
+    {
+      "path": "utils/system_utils.py",
+      "archive": "inference-comparison-20260907-r2/local_source.tar"
+    }
+  ],
+  "excluded": "standalone training runners, manual-gradient experiments, candidate materializers, datasets, weights, caches and binaries",
+  "note": "Shared runtime classes retain their original training methods to preserve the measured source; no training entry point is published."
+}

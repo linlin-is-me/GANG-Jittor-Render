@@ -9,7 +9,8 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from scene.cameras import Camera
+from __future__ import annotations
+
 import numpy as np
 from utils.general_utils import PILtoTorch,NumpytoTorch
 from utils.graphics_utils import fov2focal
@@ -19,14 +20,33 @@ import jittor.nn as F
 from typing import List
 from scipy.spatial.transform import Rotation as R, Slerp
 from scipy.interpolate import interp1d
+from PIL import Image
 
 WARNED = False
 
+
+def _source_image_size(image):
+    if isinstance(image, Image.Image):
+        width, height = image.size
+        return int(width), int(height)
+    array = np.asarray(image)
+    if array.ndim < 2:
+        raise ValueError(f"camera image must have at least two dimensions, got {array.shape}")
+    return int(array.shape[1]), int(array.shape[0])
+
+
+def _resize_image_tensor(image, resolution):
+    if isinstance(image, Image.Image):
+        return PILtoTorch(image, resolution)
+    return NumpytoTorch(image, resolution)
+
 def loadCam(args, id, cam_info, resolution_scale):
-    try:
-        orig_w, orig_h = cam_info.image.size
-    except:
-        orig_w, orig_h = cam_info.image.shape[0], cam_info.image.shape[1]
+    # Import lazily so this utility remains importable on its own.  Importing
+    # scene.cameras at module load time re-enters scene.__init__, which itself
+    # imports camera_utils.
+    from scene.cameras import Camera
+
+    orig_w, orig_h = _source_image_size(cam_info.image)
 
     if args.resolution == -1:
         if orig_w > 1600:
@@ -56,30 +76,36 @@ def loadCam(args, id, cam_info, resolution_scale):
     #     else:
     #         resized_image_rgb = resized_image_rgb.unsqueeze(dim=-1).permute(2, 0, 1)
 
-    try:
-        resized_image_rgb = PILtoTorch(cam_info.image, resolution)
-    except:
-        resized_image_rgb = NumpytoTorch(cam_info.image, resolution)
-
-
-    gt_image = resized_image_rgb[:3, ...]
+    if resolution[0] <= 0 or resolution[1] <= 0:
+        raise ValueError(f"camera resolution must be positive, got {resolution}")
+    camera_residency = str(getattr(args, "camera_residency", "device_all"))
+    if camera_residency not in {"device_all", "on_demand"}:
+        raise ValueError(f"unsupported camera residency policy: {camera_residency!r}")
+    if camera_residency == "on_demand":
+        gt_image = None
+    else:
+        resized_image_rgb = _resize_image_tensor(cam_info.image, resolution)
+        gt_image = resized_image_rgb[:3, ...]
 
     resized_image_mask = None
+    if camera_residency == "on_demand" and (
+            cam_info.image_mask is not None or cam_info.normal is not None):
+        raise ValueError(
+            "on-demand camera residency currently supports RGB supervision without "
+            "material metadata or alpha masks")
     if cam_info.image_mask is not None:
         image_mask = jt.array(np.array(cam_info.image_mask)).float().unsqueeze(0)
-        if args.resolution in [1, 2, 4, 8]:
-            # Jittor: F.interpolate replaces torchvision.transforms.Resize
-            resized_image_mask = F.interpolate(
-                image_mask.unsqueeze(0), size=(resolution[1], resolution[0]),
-                mode='nearest').squeeze(0)
-        else:
-            resized_image_mask = image_mask
+        # The effective size also changes for the -1 auto-cap policy, so resize
+        # according to the computed dimensions rather than the CLI token.
+        resized_image_mask = F.interpolate(
+            image_mask.unsqueeze(0), size=(resolution[1], resolution[0]),
+            mode='nearest').squeeze(0)
     # else:
 
     resize_normal = resize_albedo = resize_roughness = resize_metal = resize_irradiance = None
     if cam_info.normal is not None:
 
-        resize_normal = PILtoTorch(cam_info.normal, resolution)
+        resize_normal = _resize_image_tensor(cam_info.normal, resolution)
         resize_albedo = NumpytoTorch(cam_info.albedo, resolution)
         resize_roughness = NumpytoTorch(cam_info.roughness, resolution)
         resize_metal = NumpytoTorch(cam_info.metal, resolution)
@@ -119,7 +145,10 @@ def loadCam(args, id, cam_info, resolution_scale):
                   image=gt_image, normal=resize_normal,albedo=resize_albedo,roughness=resize_roughness,
                   metal=resize_metal,irradiance=resize_irradiance,gt_alpha_mask=resized_image_mask,
                   image_name=cam_info.image_name, resolution_scale=resolution_scale, 
-                  uid=id, data_device=args.data_device)
+                  uid=id, data_device=args.data_device,
+                  camera_residency=camera_residency,
+                  image_path=cam_info.image_path,
+                  target_resolution=resolution)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
