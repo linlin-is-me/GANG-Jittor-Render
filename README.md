@@ -2,6 +2,8 @@
 
 新增可选 SG 推理后端 `vector3_cuda`，默认仍为 `native`。使用方法、本地与发布代码的差异以及已有测速的适用范围见 [SG 三分量归约说明](docs/sg_vector3.md)。本次选择性移植尚未在 GPU 上重新完成端到端测速。
 
+新增原版 GANG PBR `.pth → .npz` 转换器，支持 21 项模型 capture、配套灯光与显式 LOD 元数据，详见 [检查点转换说明](docs/checkpoint_conversion.md)。
+
 本项目将 GANG（Geometrically-Aligned Neural Gaussians）的核心推理管线迁移至计图（Jittor）。完成 checkpoint 格式转换后，Jittor 推理运行时不依赖 PyTorch。Garden 40K 模型在固定的 `res=4`、24 个测试视角和 PBR + 16 SG 配置下，与 PyTorch 参考输出达到 33.92 dB PSNR 和 0.9951 SSIM；该结论只适用于下文记录的固定实验基线。
 
 ![Garden DSC08066 在原始学习光照与 14 个外部 HDR envmap 下的重光照结果](assets/envmap_relighting_garden_dsc08066_3x5.png)
@@ -348,7 +350,7 @@ python3 -u tests/test_envmap_projection.py
 ## 已知限制
 
 - 公共渲染、评估和重光照脚本尚未共用统一 checkpoint loader；
-- 仓库未提供通用的 PyTorch `.pth → .npz` 转换器，也不分发训练模型和场景数据；
+- 转换器仅支持文档列出的原版 GANG PBR 检查点，不接受任意 PyTorch 模型；仓库不分发训练模型和场景数据；
 - `render_views.py` 的跨训练分辨率 LOD 重算尚未完成；
 - `eval_psnr.py` 的 PBR 分支尚未恢复 checkpoint Hybridlight；
 - 两个 40K 命名 NPZ 入口仍依赖 LOD metadata 回退；现有 Garden 模型也没有保存完整 LOD 状态；
