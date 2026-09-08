@@ -1,364 +1,182 @@
-# GANG-Jittor-Render：基于计图的场景级神经高斯可重光照渲染器
+# GANG-Jittor-Render：基于计图的场景级可重光照神经高斯渲染器
 
-本项目将 GANG（Geometrically-Aligned Neural Gaussians）的核心推理管线迁移至计图（Jittor）。完成 checkpoint 格式转换后，Jittor 推理运行时不依赖 PyTorch。Garden 40K 模型在固定的 `res=4`、24 个测试视角和 PBR + 16 SG 配置下，与 PyTorch 参考输出达到 33.92 dB PSNR 和 0.9951 SSIM；该结论只适用于下文记录的固定实验基线。
+GANG-Jittor-Render 在计图深度学习框架与 JGaussian 渲染库的基础上，实现 GANG 的完整推理管线，贯通模型转换、场景渲染与重光照流程。完成权重转换后，渲染与重光照无需安装 PyTorch 和 nvdiffrast，即可在计图环境中独立运行。
 
-![Garden DSC08066 在原始学习光照与 14 个外部 HDR envmap 下的重光照结果](assets/envmap_relighting_garden_dsc08066_3x5.png)
+我们针对复杂场景优化光照计算。在同一块 NVIDIA RTX 4090 上，计图渲染器保持了与 PyTorch 原版接近的平均重建质量，完整前向耗时从 **87.83 ms/帧降至 59.63 ms/帧**，推理速度达到 **16.77 FPS**，显存采样峰值降低约 **40.6%**。测试条件与复现入口见下文。
 
-公开工具包含两类用途：复现已转换 PyTorch checkpoint 的兼容渲染，以及只替换环境贴图的受控重光照。核心源码仍保留默认关闭的实验性点光源和阴影分支，但阶段性研究脚本没有纳入发布目录；这部分不属于公开复现入口。
+![Garden DSC08066 在原始学习环境光及 14 张外部 HDR 环境贴图下的重光照效果](assets/envmap_relighting_garden_dsc08066_3x5.png)
 
-下图汇总 Garden 40K 模型在 `res=4` 下的 24 个测试视角，用于展示视角覆盖和整体重建效果；它不属于 Envmap 单变量对照实验。
+固定模型、材质与相机，仅替换环境贴图。第一格为模型学习到的环境光，其余为 14 张 TensoIR HDR；右下角展示实际使用的环境贴图。该展示关闭 SG 与点光源，采用固定线性裁剪显示，外部 HDR 的能量差异可能造成高亮截断。
 
-![Garden 40K 模型的 24 视角渲染结果](assets/garden_multiview_24views.jpg)
+## Part 1 从 3DGS 到场景级可重光照
 
----
+### 1.1 场景级重光照的挑战
 
-## Part 1 GANG：从 3DGS 到场景级可重光照
+三维高斯泼溅（3DGS）在实时新视角合成上表现出色，但直接存储与视角相关的颜色，难以分离几何、材质与光照。计图高斯库 JGaussian 已在物体和人像重光照等方向取得进展；面对材质多样、结构复杂的真实场景，逐高斯存储材质参数仍面临存储开销大、局部材质一致性不足等挑战。
 
-### 1.1 面向复杂真实场景的可重光照表示
+GANG（Geometrically-Aligned Neural Gaussians）将锚点式神经高斯表示与物理真实感渲染结合，实现复杂真实场景的高质量可重光照重建。该方法支持编辑场景材质与照明条件，相关论文发表于 IEEE TVCG 2026。
 
-三维高斯泼溅（3DGS）用大量椭球状高斯基元表示场景，在新视角合成中具有较高效率，但常规表示直接学习与视角相关的颜色，难以显式分离几何、材质和光照。场景重光照还需要处理尺度大、物体类型多、材质变化复杂和局部几何不稳定等问题。
+![真实场景下不同算法的重光照对照](assets/图%202真实场景下不同算法的重光照对照.png)
 
-GANG 将锚点式神经高斯表示与物理着色结合，用紧凑锚点特征解码几何和材质属性，并以混合光照模型描述全局环境光与局部直接光，从而支持复杂真实场景的重建和重光照。
+### 1.2 GANG 渲染管线的核心架构
 
-![图 2 真实场景下不同算法的重光照对照](assets/图%202真实场景下不同算法的重光照对照.png)
+GANG 以锚点组织场景，由轻量级 MLP 将紧凑特征解码为多个神经高斯的几何与 PBR 材质属性。同一锚点内的高斯共享特征和解码器，保持局部材质一致性。论文在三个数据集上的效率实验中，模型存储量平均约为 R3DG 的 1/25。
 
-### 1.2 GANG 渲染管线
+渲染时，解码器结合视线方向与距离生成高斯属性，光照模块根据材质和照明计算颜色，再经光栅化合成图像。
 
-GANG 通过锚点组织场景。每个锚点保存紧凑的潜在特征，多个轻量级 MLP 从中解码 K 个神经高斯，输出位置、旋转、缩放、不透明度、颜色，以及反照率（albedo）、粗糙度（roughness）和金属度（metallic）等 PBR 属性。
+![GANG 架构整体流程图](assets/图%203%20GANG%20架构整体流程图.svg)
 
-论文的效率实验表明，与 R3DG 相比，GANG 在三个数据集上的模型存储量平均约为其 1/25。该比例来自论文表 III 的特定基线比较，不代表对所有 3DGS 方法的普遍压缩比例。
+GANG 将 cubemap 环境光与球面高斯（SG）局部光照结合。环境贴图提供整体照明，SG 根据场景位置描述局部光照，补充方向性高光与明暗变化。两类光照结合 Cook–Torrance 材质模型计算漫反射和镜面反射，使不同材质呈现相应的光泽与反射特征。
 
-材质着色采用 Cook–Torrance 微表面 BRDF，并分别计算漫反射和镜面反射。可学习 cubemap 提供全局环境光；位置可学习的球面高斯（SG）描述局部直接光，产生方向性高光和局部明暗变化。标准 SG 路径不计算遮挡可见性，因此不应将其描述为具有物理阴影。
+![多球面高斯混合光照示意图](assets/图%204多球面高斯混合光照示意图.png)
 
-![图 3 GANG 架构整体流程图](assets/图%203%20GANG%20架构整体流程图.svg)
+## Part 2 计图渲染管线的实现与优化
 
----
+### 2.1 从预训练模型到计图推理
 
-## Part 2 Jittor 推理管线的实现
+本项目复用 JGaussian 的 CUDA 光栅化器框架、环境光模型与 BRDF 查找表积分（FG_LUT）等基础能力，接入 GANG 所需的材质与光照分量。推理路径直接调用 CUDA 前向，不建立 Tape，也不保留反向传播缓存；按阶段释放中间张量，减少多视角渲染的显存占用。
 
-### 2.1 复用 JGaussian 的基础组件
+仓库提供 `.pth → .npz` 转换工具，配套转换原版 GANG PBR 模型与灯光状态。已有预训练权重完成格式转换后，即可载入计图渲染器，无需重新训练。转换阶段需要 PyTorch，推理阶段不需要。支持的检查点结构、LOD 元数据与使用方式见 [检查点转换说明](docs/checkpoint_conversion.md)。
 
-GANG-Jittor-Render 在两处复用了 JGaussian 的基础实现。光栅化层面沿用其 CUDA 高斯光栅器的结构与前向接口，并扩展 GANG 所需的材质和诊断通道。训练路径按需保留 Tape 与梯度回调；当前推理路径直接调用 CUDA forward，不建立 Tape，也不保留反向缓存。
+### 2.2 锚点式 PBR 材质解码
 
-光照层面以 JGaussian 的环境光组织方式、cubemap 采样接口和 FG_LUT 分裂求和积分为基础，接入 GANG 的锚点式材质解码、可学习 envmap 与位置 SG。cubemap 采样随后改写为纯 Jittor 实现，消除了该环节对 nvdiffrast 的运行依赖；CUDA 高斯光栅库仍需从仓库源码编译。
+为适配 GANG 的锚点式表示，我们在计图中实现了几何与材质解码器，将锚点特征与视线方向、距离等信息组合，分别预测高斯的几何属性与反照率、粗糙度、金属度等材质参数。解码结果直接衔接光照计算与光栅化，使锚点式场景表示能够在计图中完成 PBR 渲染。
 
-### 2.2 锚点式 PBR 解码
+### 2.3 混合光照实现与 SG 计算优化
 
-Jittor 实现保留了 GANG 的锚点结构。锚点特征与视线方向、距离和层级信息组合后，分别进入几何与材质解码器。几何组输出不透明度、颜色和协方差，并由缩放与旋转推导法线；材质组输出反照率、粗糙度和金属度。解码后的神经高斯直接进入光照计算与光栅化。
+计图实现衔接环境光预积分与 SG 局部光照计算：由 cubemap 生成漫反射辐照度图和镜面反射预过滤 mipmap，同时计算 SG 对场景不同位置的光照贡献，再结合材质参数完成着色。
 
-### 2.3 推理专用光栅前向
+我们以专用 CUDA 算子优化 SG 光照中的三分量点积与范数计算，在保留原有 FP32/FP64 精度、epsilon 和 clamp 的同时提升推理速度。
 
-光栅化部分复用 JGaussian 的 CUDA 光栅器结构和前向接口。当前推理路径直接调用 CUDA forward，不建立 Tape，也不保留反向传播缓存；Tape 和梯度回调只服务训练路径。推理专用分支还会在前向结束后释放 Geometry、Binning 和 Image scratch buffer 的 Python 引用，避免多视角渲染累积上一帧的缓存。
+优化后端为 `vector3_cuda`，仅用于推理。普通可视化入口默认仍为 `native`，需显式开启优化；实测入口 `tools/render_measured.py` 已选择 `vector3_cuda` 和对应参数。详见 [SG 三分量归约说明](docs/sg_vector3.md)。
 
-### 2.4 混合光照
+### 2.4 计图原生环境纹理采样与重光照
 
-本项目验证的 Garden 40K checkpoint 使用一个可学习 cubemap 和 16 个位置 SG。cubemap 经预积分得到漫反射 irradiance 与镜面反射 mipmap；SG 根据波瓣方向、锐度、强度和位置计算局部直接光的漫反射与镜面反射，并可使用训练时的距离权重。
+原版 GANG 使用 nvdiffrast 完成环境纹理查询。我们在计图中实现所需的纹理采样，支持二维纹理、cubemap 跨面插值与多级 mipmap 查询，兼顾环境光照的连续性和不同粗糙度下的镜面反射表现。
 
-SG 本身没有深度或透射率查询。当前代码中的阴影来自独立的实验性点光源路径，默认关闭，不属于论文 SG 基线。
+该实现既能还原模型学习到的环境光，也支持替换外部 HDR 环境贴图，呈现场景在不同照明条件下的材质与光影变化。渲染运行时不再依赖 PyTorch 或 nvdiffrast；CUDA 高斯光栅库仍需按下文从源码编译。
 
-![图 4 多球面高斯混合光照示意图](assets/图%204多球面高斯混合光照示意图.png)
+## Part 3 渲染质量与推理速度
 
-### 2.5 纯 Jittor cubemap 采样
+测试在同一块 NVIDIA RTX 4090 上进行，两种渲染器加载相同模型，以相同分辨率渲染 24 个固定视角。每种实现独立运行三次，每次预热两轮、计时五轮，累计采集 360 帧数据。完整前向在每帧结束时同步设备，不插入分段同步；计时排除模型加载、编译、预热和图像保存。
 
-PyTorch 原版使用 nvdiffrast 完成二维纹理和 cubemap 采样。当前实现以 Jittor 的 `grid_sample` 替代这部分功能，覆盖二维纹理、cubemap 单级采样和 cubemap mipmap 三线性采样，因此环境贴图路径不再依赖 nvdiffrast。
+本次使用 Garden 40K 模型、全部 597027 个锚点、PBR 与 16 个 SG，固定 `res=4`，输出为 1297×840。计图版本为 1.3.11.0，采用 `vector3_cuda` 后端与 `flattened` offset 布局。
 
-这一改动只消除了纹理采样对 nvdiffrast 的依赖。整个渲染器仍需从 `submodules/light_gaussian/` 编译 CUDA 光栅库 `librasterizer.so`；仓库不提交平台相关的预编译动态库。
+### 3.1 渲染质量
 
-### 2.6 SG 数值精度
+以相同缩放方式处理的真实图像（GT）为参考，汇总 24 个视角的平均结果：
 
-SG 波瓣卷积包含相近浮点数相减。粗糙度较低时，锐度参数会放大 float32 舍入误差。当前实现只将波瓣组合和最终半球积分中的关键相消项提升为 float64，随后把结果转回 float32。
+| 指标 | PyTorch 原版 | 计图渲染器 |
+| --- | ---: | ---: |
+| PSNR ↑ | 28.342778582 dB | 28.342778142 dB |
+| SSIM ↑ | 0.897338535 | 0.897338543 |
+| LPIPS ↓ | 0.073406972 | 0.073407122 |
 
-局部双精度没有改变模型参数和最终张量的存储精度，相较全 float32 链路不会降低输出精度。它用于降低相消误差。当前仓库尚未提供单独的 float32/float64 耗时对照，因此不对性能开销作定量结论。
+PSNR 衡量像素误差，SSIM 衡量结构相似性，均越高越好；LPIPS 衡量感知差异，越低越好。三项指标均以真实图像为参考，并非两种渲染器输出之间的直接误差。LPIPS 的具体评估配置见 [实测说明](docs/measured_inference.md)。
 
-### 2.7 显存管理
+### 3.2 推理性能
 
-当前推理路径采用三类显存控制措施：
+完整前向包含高斯生成、材质与光照计算以及光栅化。
 
-- 在非 PBR MLP 与材质 MLP 之间同步并回收懒执行图；
-- 使用无 Tape 的推理专用光栅前向，并释放光栅 scratch buffer 引用；
-- 在 SG 镜面、漫反射和 envmap 阶段之间显式释放大尺寸中间张量。
+| 指标 | PyTorch 原版 | 计图渲染器 | 改善幅度 |
+| --- | ---: | ---: | ---: |
+| 完整前向耗时 | 87.83 ms/帧 | 59.63 ms/帧 | 降低 32.1% |
+| 推理速度 | 11.39 FPS | 16.77 FPS | 提升 47.3% |
+| 显存采样峰值 | 8.126 GiB | 4.829 GiB | 降低 40.6% |
 
-这些措施用于控制多 MLP、数百万神经高斯和高分辨率光栅化共同产生的峰值显存。若需公开显存结论，应同时报告模型、分辨率、视角数、显卡、光照模式和完整进程峰值，避免把单一阶段的显存增量写成整条管线的峰值。
+完整前向耗时是生成一帧所需的计算时间，FPS 表示每秒可生成的帧数；显存采样峰值是测试期间采样记录的最高显存占用。
 
----
+测试表明，在上述条件下，计图渲染器保持了与 PyTorch 原版接近的平均重建质量，同时降低完整前向耗时与显存占用，为场景级重光照提供更高效的推理支持。
 
-## Part 3 固定基线下的 Jittor–PyTorch 一致性
-
-![图 5 从上到下依次为 0K、25K、40K，左侧为 PyTorch，右侧为 Jittor](assets/图%205从上到下依次为0、25k、40k三阶段Pytorch（左）和Jittor（右）并排渲染对比.png)
-
-以下结果来自 Garden 场景的固定实验产物。Jittor 与 PyTorch 使用各阶段对应的模型状态和同一组相机，在 `res=4` 下渲染 24 个测试视角。
-
-| 指标 | 0K（随机初始化） | 25K（几何阶段） | 40K（PBR 阶段） |
-|------|:---:|:---:|:---:|
-| 渲染模式 | 非 PBR | 非 PBR | PBR + 16 SG |
-| 平均 PSNR | 26.76 dB | **48.33 dB** | **33.92 dB** |
-| 平均 SSIM | 0.8950 | **0.9998** | **0.9951** |
-| JT/PT 亮度比 | 0.9696 | 0.9978 | 1.021 |
-| 报告记录的误差阈值通过率 `<0.05` | 83.3% | 接近 100.0% | 94.5% |
-| 报告记录的误差阈值通过率 `<0.10` | 94.8% | 接近 100.0% | 99.6% |
-
-表中只呈现 24 个测试视角的平均结果。0K、25K 与 40K 数据均来自迁移期间保存的固定实验基线，不用于说明其他配置或实验分支的一致性。
-
-25K 非 PBR 路径与 PyTorch 输出接近。40K 启用材质解码、cubemap、SG 和 BRDF 后，仍保持 33.92 dB PSNR 和 0.9951 SSIM。该结果支持固定配置下的高度一致，不表示数组逐元素完全相同，也不覆盖单位法线重光照、点光源、阴影或其他实验分支。
-
----
-
-## Part 4 重建质量与 Envmap 重光照
-
-Part 3 的 Jittor–PyTorch 对比检验迁移一致性。本节的 Jittor–GT 指标衡量模型对真实观测图像的重建质量；固定场景后替换 envmap 的实验检验光照可编辑性。三类结果回答的问题不同。
-
-### 4.1 Jittor 与 GT 的三阶段重建质量
-
-在 Garden 场景、`res=4` 和相同的 24 个测试视角下，得到以下平均结果：
-
-| 指标 | 0K（随机初始化） | 25K（几何阶段） | 40K（PBR 阶段） |
-|------|:---:|:---:|:---:|
-| 渲染模式 | 非 PBR | 非 PBR | PBR + 16 SG |
-| 平均 PSNR | 11.30 dB | **28.12 dB** | **25.62 dB** |
-| 平均 SSIM | 0.1455 | **0.8867** | **0.8652** |
-| JT/GT 亮度比 | 0.677 | 0.993 | 1.045 |
-| 历史报告阈值通过率 `<0.05` | 0.87% | 79.76% | 61.53% |
-| 历史报告阈值通过率 `<0.10` | 5.86% | 95.87% | 91.48% |
-
-25K 与 40K 使用不同渲染模式。25K 直接检验几何和颜色重建；40K 增加材质、环境光和 16 个 SG 的完整 PBR 计算。因此，两列不能用于单变量训练轮次排序，迁移正确性仍由同 checkpoint、同相机条件下的 Jittor–PyTorch 对比衡量。
-
-### 4.2 只替换 Envmap 的 Garden 对照实验
-
-每组 A/B 实验固定以下条件；14 个 envmap 各自在独立进程中运行：
-
-- A/B 两侧使用同一 Garden 40K 模型和同一个 Jittor 模型实例；
-- `DSC08066` 测试视角，对应相机索引 `view120`；
-- `res=4`，相同几何、材质、相机和显示变换；
-- 两侧均关闭 SG 和点光源，只改变 cubemap base；
-- cubemap 单面分辨率为 256；
-- 场景 PNG 使用 `paper_linear_clamp`；envmap 缩略图单独使用显示百分位色调映射。
-
-第一格为 checkpoint 学习得到的环境光。其余 14 格依次使用 GANG 项目引用的 TensoIR 1K HDR envmap：`bridge`、`city`、`courtyard`、`fireplace`、`forest`、`interior`、`museum`、`night`、`snow`、`square`、`studio`、`sunrise`、`sunset` 和 `tunnel`。每个结果右下角嵌入实际参与渲染的 envmap。
-
-14 个替换实验均产生有限的线性 HDR 输出。当前高亮检查条件为 `p99.9 ≤ 1.5` 且线性 HDR 中大于 2 的像素比例不超过 0.01%。`fireplace`、`forest`、`night`、`sunrise`、`sunset` 和 `tunnel` 通过该检查；其他 envmap 保留不同程度的高亮截断或过曝，反映固定显示变换与外部 HDR 能量尺度之间的适配边界。
-
-该实验能够证明每组 A/B 内同一 Jittor 模型实例对 envmap 变化产生稳定响应。当前脚本没有把读取到的 LOD metadata 传入 `restore_numpy()`，因此它不用于证明 PyTorch checkpoint 的完整 LOD 精确回放，也不证明 SG、点光源或阴影能力。
-
----
-
-## Part 5 渲染模式与能力边界
-
-| 模式 | 光照和法线契约 | 适用结论 |
-|------|----------------|----------|
-| 序列 NPZ 兼容渲染 | `tools/render_views.py`；以 `--is_pbr` 选择渲染模式；PBR 沿用 checkpoint 兼容法线 | 用于旧序列格式模型的兼容渲染 |
-| 学习光照回放 | `tools/render_learned_light.py`；恢复学习得到的 cubemap、16 个 SG 和相关光照参数；沿用 checkpoint 兼容法线 | 用于检查训练完成后的模型外观 |
-| Envmap A/B | `tools/relight_envmap.py`；SG 和点光源关闭，两侧共用同一模型实例，只替换 cubemap base；沿用 checkpoint 兼容法线 | 用于验证 envmap 可编辑性 |
-| 点光源与阴影 | 核心源码保留默认关闭的实验分支，发布目录不含阶段性研究 runner | 不属于论文基线或当前公开复现承诺 |
-
-checkpoint 兼容法线指 GANG 历史路径使用的 `[0,1]` 编码。上述公开 PBR 入口均沿用 `render()` 的默认值 `normalize_for_light=False`，不会把法线改成单位世界空间向量。Envmap A/B 因此验证的是固定模型与固定法线契约下的光照可编辑性，不代表单位法线条件下的物理重光照。
-
----
+以上为固定测试环境下的实测结果。完整统计、逐帧记录、独立光栅器与 RGB-only 路径的结果，以及复现条件见 [实测版本说明](docs/measured_inference.md) 和 [原始统计](docs/benchmarks/20260908/three_run_summary.json)。不同 GPU、驱动与软件环境下的速度可能不同。
 
 ## 快速开始
 
-以下命令均从仓库根目录执行。
+以下命令均从仓库根目录执行。模型、场景数据、第三方 HDR 和预编译动态库不随源码分发。
 
-### 已验证环境
+### 安装与构建
 
-- WSL2，当前光栅器以 Linux `.so` 动态库形式链接；
-- Python 3.10.12；
-- Jittor 1.3.11；
-- NVIDIA GeForce RTX 4060 Laptop GPU，8 GB 显存。
-
-当前可追溯的实验 manifest 没有记录完整 CUDA 版本号，因此 README 不对 CUDA 11.8 至 12.x 的整个区间作兼容性承诺。其他 Python、CUDA、操作系统和 GPU 组合需要单独验证。
+使用 Linux/WSL 的计图 CUDA 环境，需要 CUDA Toolkit、C++ 编译器及 CMake。实测环境为 RTX 4090，构建时使用 SM 89；其他显卡应选择对应架构。
 
 ```bash
 pip install -r requirements.txt
+pip install nvidia-ml-py
+GANG_CUDA_ARCHS=89 bash submodules/light_gaussian/_rebuild.sh stable
 ```
 
-### 编译 CUDA 光栅库
+### 复现实测推理
 
-源码构建需要 CMake 3.20 或更高版本、CUDA Toolkit 与 `nvcc`、支持 C++17 的编译器、`make`，以及提供 `nm` 的 binutils。仓库不提交预编译 `.so`。当前 CMake 配置包含 SM 70/75/86；RTX 4060（SM 89）的已验证环境沿用 SM 86 cubin。重新执行 CMake 不会自动加入新架构，因为 `CUDA_ARCHITECTURES` 仍在 `submodules/light_gaussian/CMakeLists.txt` 中固定设置。
+权重目录需包含实测使用的 `model.npz` 与 `outputs.log`，后者提供对应模型的 LOD 参数。固定相机清单已包含在仓库中；只渲染和测速无需 GT 图片，对 GT 评价质量时才需要原始图像。
 
 ```bash
-cd submodules/light_gaussian
-mkdir -p build && cd build
-cmake ..
-make
-cp -f libCudaRasterizer.so librasterizer.so
-nm -D librasterizer.so | grep -q 'lite_forward'
-nm -D librasterizer.so | grep -q 'receiver_forward'
-cd ../../..
+# 先检查三个固定视角。
+python tools/render_measured.py --weights /path/to/garden_40k \
+  --output outputs/measured_smoke --smoke --rounds 1
+
+# 完整前向：两轮预热、五轮计时。
+python tools/render_measured.py --weights /path/to/garden_40k \
+  --output outputs/measured_full_A
 ```
 
-CMake 目标生成 `libCudaRasterizer.so`，运行时读取 `librasterizer.so`，因此复制步骤不能省略。当前扩展还要求 `lite_forward` 和 `receiver_forward` 两个导出符号。修改目标架构后，需要重新验证光栅输出、导出符号和多视角稳定性。
+输出目录存在时拒绝覆盖。重复测试请使用新的 B、C 目录。该入口用于固定实验复现，不能任意替换模型结构或检查点格式。PyTorch 对照环境和历史模型的材质参数顺序见 [实测说明](docs/measured_inference.md)。
 
-### 当前入口与 checkpoint 格式
+### 转换权重与渲染
 
-当前仓库尚未统一 checkpoint schema。不同脚本不能任意交换 NPZ 文件。
+转换器支持文档列出的原版 GANG PBR capture、配套灯光和显式 LOD 元数据，不支持任意 PyTorch 模型，也不用于跨框架续训。请先按 [检查点转换说明](docs/checkpoint_conversion.md) 准备输入并确认材质参数顺序。
 
-| 格式 | 主要字段 | 当前入口 | 状态 |
-|------|----------|----------|------|
-| 序列 NPZ | `_n_items`、`item_0 ... item_N` | `tools/render_views.py`、`tools/eval_psnr.py` | 旧公共入口 |
-| 40K 扁平命名 NPZ | `_anchor`、拆分后的 `mlp_*_w1/w2`、`light_*` 等约 46 个字段 | `tools/relight_envmap.py`、`tools/render_learned_light.py` | Garden PBR 入口 |
-
-PyTorch `.pth` 不能由 Jittor 入口直接读取。当前仓库没有通用、参数化且覆盖 PBR 光照和 LOD metadata 的 `.pth → .npz` 转换器，也不随源码分发 Garden checkpoint 与相机文件。使用者需要准备匹配上表 schema 的 NPZ、对应的相机 JSON 和数据集；发布模型时应同时提供 schema 版本和校验哈希。
-
-40K 命名 NPZ 入口读取相机数组。每项必须包含 `id`、原始图像的 `width` 和 `height`、像素焦距 `fx` 和 `fy`、3×3 camera-to-world `rotation`，以及世界坐标中的相机 `position`；`img_name` 只用于输出记录。`--views` 接受相机数组下标，不按 `id` 搜索。最小结构如下：
-
-```json
-[
-  {
-    "id": 0,
-    "img_name": "DSC00000",
-    "width": 5184,
-    "height": 3360,
-    "fx": 3844.9,
-    "fy": 3852.4,
-    "rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
-    "position": [0, 0, 0]
-  }
-]
-```
-
-影响 LOD 精确恢复的字段包括 `standard_dist`、`voxel_size`、`levels`、`init_level` 和 `_extra_level`。字段缺失时，`GaussianModel.restore_numpy()` 会从锚点和层级估算部分参数；该回退适合兼容加载，不等同于原 checkpoint 的严格 LOD 回放。
-
-`tools/relight_envmap.py` 与 `tools/render_learned_light.py` 当前没有把独立 LOD metadata 传给 `restore_numpy()`，序列 NPZ 入口 `render_views.py` 也依赖 checkpoint 内已有状态。现有 Garden 40K 命名 NPZ 还缺少 `voxel_size`、`levels`、`init_level` 和 `_extra_level`，因此这些入口目前均不构成完整 LOD 精确回放。
-
-### 序列 NPZ 渲染
-
-`tools/render_views.py` 当前不能完成跨训练分辨率的严格 LOD 重算，因此必须显式传入模型训练时使用的分辨率除数。
+建议在已安装 PyTorch 和 NumPy 的独立环境中执行转换命令，生成 NPZ 后，再切换到计图推理环境执行渲染命令。上文的安装步骤仅配置计图推理环境。
 
 ```bash
-# 以下仅演示训练分辨率除数为 4 的序列 NPZ；其他模型应改为各自训练值
-# 非 PBR
-python3 -u tools/render_views.py \
-    --npz /path/to/item_sequence_checkpoint.npz \
-    --source_path /path/to/scene \
-    --resolution 4 \
-    --is_pbr 0 \
-    --out_dir outputs/renders
+# 在 PyTorch 转换环境中执行。
+python tools/convert_pytorch_checkpoint.py \
+  --checkpoint /path/to/chkpnt40000.pth \
+  --light /path/to/Hybridlight40000.npy \
+  --metadata /path/to/metadata.json \
+  --output /path/to/model_named.npz \
+  --trust-pickle
 
-# PBR：checkpoint 必须包含可恢复的 Hybridlight 状态
-python3 -u tools/render_views.py \
-    --npz /path/to/item_sequence_pbr_checkpoint.npz \
-    --source_path /path/to/scene \
-    --resolution 4 \
-    --is_pbr 1 \
-    --out_dir outputs/renders_pbr
+# 切换到计图推理环境后执行。
+python tools/render_learned_light.py \
+  --model-npz /path/to/model_named.npz \
+  --camera-json /path/to/cameras.json \
+  --views '0 1 2' --res 4 --base-res 256 \
+  --sg-reduce-backend vector3_cuda \
+  --output-dir outputs/learned_light
 ```
 
-若 PBR checkpoint 不含 Hybridlight 状态，该脚本会保留随机初始化的 cubemap、SG 和相关光照参数。此输出只适合检查管线能否运行，不能作为训练模型的重建或重光照结果。
+仅对可信文件使用 `--trust-pickle`。相机 JSON 需另行提供，`--views` 指相机数组下标；`--res` 应与模型训练分辨率匹配，`--base-res` 应与灯光 cubemap 尺寸匹配。此可视化入口使用 ACES 显示变换，不替代实测入口。
 
-### 非 PBR PSNR / SSIM 评估
+### 替换环境贴图
 
-当前 `tools/eval_psnr.py` 的 PBR 光照恢复尚未与新版 `Hybridlight` 接口对齐。以下入口只用于非 PBR 序列 NPZ：
+以下示例固定几何、材质与相机，关闭 SG 和点光源，只替换 cubemap。第三方 HDR 可从原版 GANG 引用的 [TensoIR envmap 归档](https://drive.google.com/file/d/10WLc4zk2idf4xGb6nPL43OXTTHvAXSR3/view) 获取。
 
 ```bash
-python3 -u tools/eval_psnr.py \
-    --model_path /path/to/model_directory \
-    --iteration 25000 \
-    --source_path /path/to/scene \
-    --resolution 4 \
-    --is_pbr 0
+python tools/relight_envmap.py \
+  --model-npz /path/to/model_named.npz \
+  --camera-json /path/to/cameras.json \
+  --views '120' --comparison-view 120 \
+  --res 4 --base-res 256 \
+  --hdr-path /path/to/night.hdr \
+  --replacement-label night \
+  --scene-output paper_linear_clamp \
+  --output-dir outputs/envmap_night
 ```
 
-Part 3 和 Part 4 的 40K PBR 指标来自固定实验产物，不由当前 PBR 评估入口直接复现。
+示例下标 120 对应首页实验的 DSC08066；更换相机清单时应核对下标。脚本保存图像、线性 HDR 数组、A/B 对比图和参数记录。批量替换 HDR 时建议每张使用独立进程与输出目录，避免多套环境纹理同时驻留显存。
 
-### 学习光照回放
+## 使用范围
 
-以下命令恢复 40K 命名 NPZ 中学习得到的 cubemap、16 个 SG 和相关光照参数：
+- 本仓库提供推理与重光照工具，不提供完整训练入口。
+- 普通可视化入口与固定测速入口具有不同的相机、显示和加载约定；复现 59.63 ms/帧对应的测试应使用 `render_measured.py`。
+- 命名 NPZ 与旧 item-sequence NPZ 不可混用。模型未保存的 LOD 状态需要另行提供；转换器对 `_extra_level` 的处理见转换文档。
+- 标准 SG 路径不计算遮挡可见性。点光源与阴影属于默认关闭的实验分支，不属于本页的质量与速度结论。
+- 公开 PBR 入口保留原模型的法线约定，环境贴图替换不改变模型材质或法线。
+- 当前许可证仅允许非商业研究和评估用途，具体条款见 [LICENSE](LICENSE)。
 
-```bash
-python3 -u tools/render_learned_light.py \
-    --model-npz /path/to/model.npz \
-    --camera-json /path/to/cameras.json \
-    --views "0 1 2" \
-    --res 4 \
-    --output-dir outputs/learned_light
-```
+## 相关资料
 
-### Garden Envmap A/B 复现
+GANG 方法：D. Li, S.-S. Huang, H. Fu, and H. Huang, *GANG: Geometrically-Aligned Neural Gaussians for Efficient and Realistic Relighting*, IEEE TVCG, 2026. DOI: [10.1109/TVCG.2026.3687668](https://doi.org/10.1109/TVCG.2026.3687668)。原版项目：[wanglids/GANG](https://github.com/wanglids/GANG)。
 
-这是固定的 Garden 40K 命名 NPZ 实验脚本，不是通用模型接口。14 个 HDR 文件来自 GANG 原版 README 指向的 [TensoIR envmap 归档](https://drive.google.com/file/d/10WLc4zk2idf4xGb6nPL43OXTTHvAXSR3/view)。这些第三方 HDR 不随仓库分发；下载后将所需文件放入 `scene/NVDIFFREC/irrmaps/tensoir/high_res_envmaps_1k/`，或在命令中传入其他绝对路径。
+本工作复用了计图高斯库 [JGaussian](https://github.com/IGLICT/JGaussian) 的光栅化器框架与 PBR 基础组件。
 
-以 `night.hdr` 和 `DSC08066` 为例：
-
-```bash
-python3 -u tools/relight_envmap.py \
-    --model-npz /path/to/model.npz \
-    --camera-json /path/to/cameras.json \
-    --views "120" \
-    --comparison-view 120 \
-    --res 4 \
-    --base-res 256 \
-    --hdr-path scene/NVDIFFREC/irrmaps/tensoir/high_res_envmaps_1k/night.hdr \
-    --replacement-label night \
-    --scene-output paper_linear_clamp \
-    --output-dir outputs/paper_fig9_dsc08066_linear/night
-```
-
-脚本保存显示 PNG、线性 HDR `.npy`、envmap 缩略图、A/B 对比图和 `envmap_ab_params.json`。参数文件记录 checkpoint、相机和 HDR 哈希、图像尺寸、显示变换、显存峰值和高亮检查结果。
-
-高亮门槛用于筛选展示图片，不决定渲染产物是否有效。默认情况下，实验契约与必需展示检查全部通过时脚本返回 0；检查范围包括输入身份、光照状态、有限值、显存上限、投影、文件来源、尺寸与图注。高亮超限会打印 `ENVIRONMENT_MAP_AB_PASS_WITH_HIGHLIGHT_WARNING`。需要在 CI 中把高亮超限视为失败时，可增加 `--fail-on-highlight`。
-
-14 个 envmap 建议在独立进程中依次渲染，避免多套 cubemap 和预过滤纹理同时驻留显存：
-
-```bash
-GANG_ENVMAP_ROOT=scene/NVDIFFREC/irrmaps/tensoir/high_res_envmaps_1k
-GANG_ENV_NAMES=(bridge city courtyard fireplace forest interior museum night snow square studio sunrise sunset tunnel)
-GANG_MODEL=/path/to/model.npz
-GANG_CAMERAS=/path/to/cameras.json
-
-for name in "${GANG_ENV_NAMES[@]}"; do
-    python3 -u tools/relight_envmap.py \
-        --model-npz "${GANG_MODEL}" \
-        --camera-json "${GANG_CAMERAS}" \
-        --views "120" \
-        --comparison-view 120 \
-        --res 4 \
-        --base-res 256 \
-        --hdr-path "${GANG_ENVMAP_ROOT}/${name}.hdr" \
-        --replacement-label "${name}" \
-        --scene-output paper_linear_clamp \
-        --output-dir "outputs/paper_fig9_dsc08066_linear/${name}"
-done
-```
-
-生成 3 列 5 行网格：
-
-```bash
-python3 -u tools/compose_envmap_grid.py \
-    --root outputs/paper_fig9_dsc08066_linear \
-    --view 120 \
-    --names "bridge city courtyard fireplace forest interior museum night snow square studio sunrise sunset tunnel" \
-    --cols 3 \
-    --original-position first \
-    --no-footer \
-    --output-name garden_DSC08066_all_envmaps_3x5.png
-```
-
-为保证结果可追溯，应保留每个子目录的 `envmap_ab_params.json`，并在发布时同时提供模型、相机、HDR 来源和脚本版本。
-
-envmap 展开方向可在同一环境中运行以下回归测试：
-
-```bash
-python3 -u tests/test_envmap_projection.py
-```
-
----
-
-## 已知限制
-
-- 公共渲染、评估和重光照脚本尚未共用统一 checkpoint loader；
-- 转换器仅支持文档列出的原版 GANG PBR 检查点，不接受任意 PyTorch 模型；仓库不分发训练模型和场景数据；
-- `render_views.py` 的跨训练分辨率 LOD 重算尚未完成；
-- `eval_psnr.py` 的 PBR 分支尚未恢复 checkpoint Hybridlight；
-- 两个 40K 命名 NPZ 入口仍依赖 LOD metadata 回退；现有 Garden 模型也没有保存完整 LOD 状态；
-- 点光源、面积灯和透射率阴影属于实验性推理扩展，阶段性 runner 未纳入公开工具，不代表论文基线具备物理阴影；
-- 当前许可证仅允许非商业研究和评估用途，具体条款见 `LICENSE`。
-
----
-
-## 参考资料
-
-GANG 原版项目：<https://github.com/wanglids/GANG>
-
-本工作复用了计图高斯库 JGaussian 的光栅化器框架与 PBR 基础组件：<https://github.com/IGLICT/JGaussian>
-
-GANG-Jittor-Render 与 JGaussian 均基于计图（Jittor）深度学习框架开发。计图是清华大学开源的国产深度学习框架，官网为：<https://cg.cs.tsinghua.edu.cn/jittor/>
+GANG-Jittor-Render 与 JGaussian 均基于[计图深度学习框架](https://cg.cs.tsinghua.edu.cn/jittor/)开发。第三方组件归属与许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
