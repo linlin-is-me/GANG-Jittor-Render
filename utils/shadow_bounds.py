@@ -1,7 +1,11 @@
-"""Pure-NumPy transmittance-boundary calibration.
+"""Pure-NumPy transmittance-boundary calibration (N3-A §21).
 
-The module has no Jittor dependency, so callers can validate the boundary
-contract without initializing CUDA:
+No jittor import — this module runs on Windows/Python AND WSL/Jittor alike, so
+`tools/_test_shadow_bounds.py` can validate the exact-N / strictly-increasing /
+finite-positive / q-coverage contract WITHOUT initialising CUDA (guide §20.2
+item 4: the previous host-side test could not run without Jittor).
+
+N3-A contract (guide §21 N3-A):
   1. output length == n exactly
   2. strictly increasing float32 — finite, positive, adjacent log-depth interval
      > 0 (checked AFTER the float32 conversion; a collapsed pair is re-spread

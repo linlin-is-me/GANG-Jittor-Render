@@ -31,18 +31,16 @@ class Scene:
         """
         :param path: Path to colmap scene main folder.
         """
+        if load_iteration is not None:
+            raise RuntimeError(
+                "Scene(load_iteration=...) is retired because the PLY-adjacent "
+                "checkpoint omits optimizer, RNG, topology and light state; "
+                "restore a strict v2 checkpoint before constructing Scene")
+
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
         self.resolution_scales = resolution_scales
-
-        if load_iteration:
-            if load_iteration == -1:
-                self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, "point_cloud"))
-            else:
-                self.loaded_iter = load_iteration
-                
-            print("Loading trained model at iteration {}".format(self.loaded_iter))
 
         self.train_cameras = {}
         self.test_cameras = {}
@@ -95,17 +93,21 @@ class Scene:
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
             jt.sync()
 
-        if self.loaded_iter:
-            self.gaussians.load_ply_sparse_gaussian(os.path.join(self.model_path,
-                                                           "point_cloud",
-                                                           "iteration_" + str(self.loaded_iter),
-                                                           "point_cloud.ply"))
-            self.gaussians.load_mlp_checkpoints(os.path.join(self.model_path,
-                                                           "point_cloud",
-                                                           "iteration_" + str(self.loaded_iter)))
-            print("Load Voxel Size: ", self.gaussians.voxel_size)
-            print("Load Standard Dist: ", self.gaussians.standard_dist)
-        elif not skip_octree:
+        # Keep the exact point set used by create_from_pcd available when a
+        # strict checkpoint skips octree construction.  Legacy phase2 seed
+        # conversion uses it once to reconstruct formerly omitted, phase2-
+        # inactive topology metadata without changing the restored anchors.
+        points = np.unique(points.numpy() if isinstance(points, jt.Var) else points, axis=0)
+        do_subsample = hasattr(args, 'max_points') and args.max_points > 0
+        if do_subsample and len(points) > args.max_points:
+            rng = np.random.RandomState(42)
+            idx = rng.choice(len(points), args.max_points, replace=False)
+            points = points[idx]
+            if logger:
+                logger.info(f"Subsampled points: {len(points)} (max_points={args.max_points})")
+        self.initial_points = np.ascontiguousarray(points, dtype=np.float32)
+
+        if not skip_octree:
             if logger is not None:
                 if args.random_background:
                     logger.info("Using random background")
@@ -113,16 +115,6 @@ class Scene:
                     logger.info("Using white background")
                 else:
                     logger.info("Using black background")
-            # Workaround: jt.array(numpy) doesn't fully copy large arrays to GPU.
-            # Keep as numpy throughout initialization, convert only at model param creation.
-            points = np.unique(points.numpy() if isinstance(points, jt.Var) else points, axis=0)
-            # Optional: subsample points for controlled anchor count (max_points > 0)
-            do_subsample = hasattr(args, 'max_points') and args.max_points > 0
-            if do_subsample and len(points) > args.max_points:
-                rng = np.random.RandomState(42)
-                idx = rng.choice(len(points), args.max_points, replace=False)
-                points = points[idx]
-                if logger: logger.info(f"Subsampled points: {len(points)} (max_points={args.max_points})")
             # Always compute correct LOD levels from camera distances.
             # Phase 41 fix: removed the levels=3/init_level=1 hack that truncated
             # the octree and made most anchors permanently invisible.
@@ -141,10 +133,6 @@ class Scene:
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
-        try:
-            self.gaussians.save_mlp_checkpoints(point_cloud_path)
-        except Exception as e:
-            print(f"[INFO] save_mlp_checkpoints skipped: {e}")
 
     def getTrainCameras(self):
         all_cams = []   

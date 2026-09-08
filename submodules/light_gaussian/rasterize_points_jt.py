@@ -1,69 +1,51 @@
 # JGaussian-aligned: cuda_header with #include + direct CudaRasterizer::Rasterizer::* calls.
 # forward_0/forward_1 split for exact buffer sizing (aligned with JGaussian Phase 2.4a).
-import hashlib
 import os
 import numpy as np
 import jittor as jt
+from rasterizer_provenance import jit_header_dir, validate_rasterizer_build
 
-# Phase 22: Global cache for CUDA backward gradients (bypass Jittor autograd crash)
-GRAD_CACHE = {}
-
-# M1 (P0.2): OOB diagnostics gate; set RASTER_DIAG=1 to report buffer sizes +
+# M1 (P0.2): OOB diagnostics gate — set RASTER_DIAG=1 to report buffer sizes +
 # radii statistics (gated, no change to numeric results).
 _DIAG_BUFFER = os.environ.get('RASTER_DIAG') == '1'
 
 _base = os.path.dirname(os.path.abspath(__file__))
-_header = os.path.join(_base, 'cuda_rasterizer')
 _glm = os.path.join(_base, 'third_party', 'glm')
-_lib = os.path.join(_base, 'build')
+_variant = os.environ.get('GANG_RASTER_BACKWARD_VARIANT', 'stable')
+if _variant == 'stable':
+    _build_identity = validate_rasterizer_build(_base)
+else:
+    if os.environ.get('GANG_ALLOW_EXPERIMENTAL_RASTERIZER') != '1':
+        raise RuntimeError(
+            'experimental rasterizer import requires '
+            'GANG_ALLOW_EXPERIMENTAL_RASTERIZER=1')
+    _build_identity = validate_rasterizer_build(_base, _variant)
+_lib = _build_identity['build_dir']
+_header = str(jit_header_dir(_base, _variant))
 
 # CRITICAL: If project path contains spaces, nvcc/ld misparses ALL -I/-L flags.
 # The space splits the flag argument in Jittor's compiler, even with quotes.
 # Workaround: symlink/copy to /tmp/ (no spaces) and use those paths.
 if ' ' in _base:
     import shutil
-
-    # Isolate the compiler workaround per checkout. A shared fixed directory can
-    # mix headers and binaries from different clones in the same WSL instance.
-    _repo_key = hashlib.sha256(os.path.realpath(_base).encode('utf-8')).hexdigest()[:12]
-    _safe_root = os.path.join('/tmp', f'jt_rasterizer_{_repo_key}')
+    _safe_root = '/tmp/jt_rasterizer'
     os.makedirs(_safe_root, exist_ok=True)
-
-    def _replace_symlink(source, link_path):
-        source = os.path.realpath(source)
-        if os.path.islink(link_path) and os.path.realpath(link_path) == source:
-            return
-        if os.path.lexists(link_path):
-            if os.path.isdir(link_path) and not os.path.islink(link_path):
-                shutil.rmtree(link_path)
-            else:
-                os.unlink(link_path)
-        os.makedirs(os.path.dirname(link_path), exist_ok=True)
-        temp_link = f'{link_path}.tmp-{os.getpid()}'
-        if os.path.lexists(temp_link):
-            os.unlink(temp_link)
-        os.symlink(source, temp_link)
-        os.replace(temp_link, link_path)
-
-    # Copy the shared library atomically so concurrent imports never observe a
-    # partially written file.
+    # Copy librasterizer.so
     _safe_lib = os.path.join(_safe_root, 'build')
     os.makedirs(_safe_lib, exist_ok=True)
     _safe_so = os.path.join(_safe_lib, 'librasterizer.so')
     _src_so = os.path.join(_lib, 'librasterizer.so')
     if os.path.exists(_src_so):
-        _temp_so = f'{_safe_so}.tmp-{os.getpid()}'
-        shutil.copy2(_src_so, _temp_so)
-        os.replace(_temp_so, _safe_so)
-    elif os.path.lexists(_safe_so):
-        # Do not silently reuse a binary left by an earlier checkout at the
-        # same absolute path. A clean clone must first follow the build step.
-        os.unlink(_safe_so)
-
+        shutil.copy2(_src_so, _safe_so)
+    # Symlink cuda_rasterizer headers
     _safe_header = os.path.join(_safe_root, 'cuda_rasterizer')
-    _replace_symlink(_header, _safe_header)
+    if not os.path.exists(_safe_header):
+        os.symlink(_header, _safe_header)
+    # Symlink glm headers
     _safe_glm = os.path.join(_safe_root, 'third_party/glm')
-    _replace_symlink(_glm, _safe_glm)
+    if not os.path.exists(_safe_glm):
+        os.makedirs(os.path.dirname(_safe_glm), exist_ok=True)
+        os.symlink(_glm, _safe_glm)
     _lib = _safe_lib
     _header = _safe_header
     _glm = _safe_glm
@@ -85,6 +67,29 @@ cuda_header = """
 #include <functional>
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
+
+// rasterizer_impl.h intentionally does not export auxiliary.h's CHECK_CUDA
+// macro to JIT consumers. Keep the same error and synchronization contract at
+// this boundary so surface-align failures cannot remain asynchronous/silent.
+#ifndef CHECK_CUDA
+#define CHECK_CUDA(A, debug) do { \
+A; \
+auto gang_cuda_call_status = cudaGetLastError(); \
+if (gang_cuda_call_status != cudaSuccess) { \
+std::cerr << "\\n[CUDA ERROR] after " << #A << ": " \
+          << cudaGetErrorString(gang_cuda_call_status); \
+throw std::runtime_error(cudaGetErrorString(gang_cuda_call_status)); \
+} \
+if (debug) { \
+auto gang_cuda_sync_status = cudaDeviceSynchronize(); \
+if (gang_cuda_sync_status != cudaSuccess) { \
+std::cerr << "\\n[CUDA ERROR] after synchronize: " \
+          << cudaGetErrorString(gang_cuda_sync_status); \
+throw std::runtime_error(cudaGetErrorString(gang_cuda_sync_status)); \
+} \
+} \
+} while(false)
+#endif
 
 // ---- surface_align KNN kernels (device code) ----
 
@@ -197,12 +202,12 @@ void launch_surface_align(int P, int K,
     const float* xyzs, const float* rotations, const int* knn_index,
     float* out_loss_d, float* out_loss_normal, float* out_mean_d)
 {
-    cudaMemset(out_loss_d, 0, P * K * sizeof(float));
-    cudaMemset(out_loss_normal, 0, P * K * sizeof(float));
-    cudaMemset(out_mean_d, 0, P * K * sizeof(float));
-    processKNNCUDA<<<(P + 255) / 256, 256>>>(P, K, xyzs, rotations, knn_index,
-        out_mean_d, out_loss_d, out_loss_normal);
-    cudaDeviceSynchronize();
+    CHECK_CUDA(cudaMemset(out_loss_d, 0, P * K * sizeof(float)), false);
+    CHECK_CUDA(cudaMemset(out_loss_normal, 0, P * K * sizeof(float)), false);
+    CHECK_CUDA(cudaMemset(out_mean_d, 0, P * K * sizeof(float)), false);
+    CHECK_CUDA((processKNNCUDA<<<(P + 255) / 256, 256>>>(
+        P, K, xyzs, rotations, knn_index,
+        out_mean_d, out_loss_d, out_loss_normal)), true);
 }
 
 void launch_surface_align_backward(int P, int K,
@@ -211,11 +216,17 @@ void launch_surface_align_backward(int P, int K,
     const float* grad_out_loss_d, const float* grad_out_loss_normal,
     float* dL_dxyzs, float* dL_drotations)
 {
-    processKNNBackwardCUDA<<<(P + 255) / 256, 256>>>(P, K, xyzs, rotations,
+    // PyTorch reference allocates both outputs with torch::full(..., 0.0)
+    // before the atomic-add kernel. jt.code output storage is not guaranteed
+    // to inherit the value of the shape/dtype template Var.
+    CHECK_CUDA(cudaMemset(
+        dL_dxyzs, 0, P * K * 3 * sizeof(float)), false);
+    CHECK_CUDA(cudaMemset(
+        dL_drotations, 0, P * K * 4 * sizeof(float)), false);
+    CHECK_CUDA((processKNNBackwardCUDA<<<(P + 255) / 256, 256>>>(P, K, xyzs, rotations,
         knn_index, mean_d,
         grad_out_loss_d, grad_out_loss_normal,
-        dL_dxyzs, dL_drotations);
-    cudaDeviceSynchronize();
+        dL_dxyzs, dL_drotations)), true);
 }
 // Phase 36: CUDA 12.6 defines cudaMemcpy as a macro (→ cudaMemcpy_ptds, static __inline__).
 // --cudart=shared needs the actual dynamic symbol, so undefine the macro.
@@ -247,6 +258,11 @@ def depthToNormal(depth_map, viewmatrix, focal_x, focal_y):
                        cuda_header=cuda_header,
                        cuda_src=f'''
             int H={H},W={W};
+            // Match the PyTorch wrapper's torch::full(..., 0.0): the CUDA
+            // kernel intentionally returns without writing border pixels and
+            // invalid depth neighbourhoods, so jt.code's output buffer must
+            // be cleared before the kernel launch.
+            cudaMemset(out0_p, 0, sizeof(float) * 3 * H * W);
             CudaRasterizer::Rasterizer::depthToNormal(W, H, {focal_x}f, {focal_y}f, in1_p, in0_p, out0_p);
         ''')
         out.compile_options = proj_options
@@ -255,13 +271,17 @@ def depthToNormal(depth_map, viewmatrix, focal_x, focal_y):
 
 # ---------------------------------------------------------------------------
 def compute_buffer_size(means3D, image_width, image_height):
-    """ImageState size — exact formula matching required<ImageState>(N) in rasterizer_impl.h.
-    (GeometryState now comes from query_state_size(); see guide P0.1.)"""
-    P = int(means3D.shape[0])
+    """Return the native ``required<ImageState>`` allocation size.
+
+    ``ImageState::fromChunk`` aligns each of its three arrays independently.
+    A linear ``N * bytes + padding`` estimate is therefore not exact and can
+    under-allocate the buffer for valid image sizes.
+    """
     W = int(image_width); H = int(image_height)
-    N = W * H
-    img = N * 16 + 128
-    return img
+    return query_state_size('ImageState', W * H)
+
+
+_STATE_SIZE_CACHE = {}
 
 
 def query_state_size(state_name, count):
@@ -271,13 +291,22 @@ def query_state_size(state_name, count):
     use the same header-only templates. Returns the exact byte count required by
     CudaRasterizer::fromChunk — no Python heuristics, no cap, no fallback.
     """
+    if state_name not in {'GeometryState', 'ImageState', 'BinningState'}:
+        raise ValueError(f"unsupported rasterizer state: {state_name}")
+    count = int(count)
+    if count < 0:
+        raise ValueError(f"negative rasterizer state count: {count}")
+    cache_key = (state_name, count)
+    if cache_key in _STATE_SIZE_CACHE:
+        return _STATE_SIZE_CACHE[cache_key]
+
     out = jt.array(jt.zeros([1], dtype=jt.int64))
     dummy = jt.array(jt.zeros([1], dtype='int32'))
     with jt.flag_scope(compile_options=proj_options):
         (out,) = jt.code(
             outputs=[out],
             inputs=[dummy],
-            data={'CNT': int(count)},
+            data={'CNT': count},
             cuda_header=cuda_header,
             cuda_src=f'''
 @alias(out, out0) @alias(dummy, in0)
@@ -288,6 +317,7 @@ cudaMemcpy(out_p, &sz, sizeof(size_t), cudaMemcpyHostToDevice);
     sz = int(out.data[0])
     if sz <= 0:
         raise RuntimeError(f"[rasterizer] invalid {state_name} size={sz} for count={count}")
+    _STATE_SIZE_CACHE[cache_key] = sz
     return sz
 
 
@@ -299,9 +329,7 @@ def RasterizeGaussiansCUDA(
     image_height, image_width, sh, degree, campos,
     prefiltered, debug,
 ):
-    """Simplified: single-phase rasterize using heuristic buffer sizes.
-    Avoids the forward_0→host_buf→forward_1 split which is unreliable
-    on non-unified-memory GPUs (RTX 3060)."""
+    """Run the two native forward phases with exact ``required<State>`` sizes."""
     P, H, W = int(means3D.shape[0]), int(image_height), int(image_width)
     D = degree
     M = sh.shape[1] if sh.ndim >= 2 and sh.shape[0] > 0 else 0
@@ -316,7 +344,7 @@ def RasterizeGaussiansCUDA(
     # (The root-cause offset-gather fix in gaussian_renderer resolved the multi-view
     # corruption; the exact sizes are verified correct.)
     geom_size = query_state_size('GeometryState', P)
-    img_size = compute_buffer_size(means3D, W, H)
+    img_size = query_state_size('ImageState', H * W)
 
     with jt.flag_scope(compile_options=proj_options):
         # === Phase 1: forward_0 (preprocess + count) ===
@@ -471,12 +499,31 @@ if (P != 0) {
         for o in [out_color, out_depth, out_opacity, out_norm, out_alpha, out_extra]:
             o.compile_options = proj_options
 
+        # ImageState owns the per-pixel last-contributor count written by
+        # forward_1.  The old wrapper returned a zero placeholder even though
+        # the CUDA backend had already produced the real array.  Export the
+        # existing device data so the public result matches the source operator.
+        n_contrib = jt.array(jt.zeros([H, W], dtype='int32'))
+        (n_contrib,) = jt.code(
+            outputs=[n_contrib],
+            inputs=[imgBuffer],
+            data={'N': H * W},
+            cuda_header=cuda_header,
+            cuda_src='''
+@alias(contrib_out, out0) @alias(imgBuffer, in0)
+char* image_chunk = (char*)imgBuffer_p;
+CudaRasterizer::ImageState image_state =
+    CudaRasterizer::ImageState::fromChunk(image_chunk, data["N"]);
+cudaMemcpy(contrib_out_p, image_state.n_contrib,
+           data["N"] * sizeof(uint32_t), cudaMemcpyDeviceToDevice);
+''')
+        n_contrib.compile_options = proj_options
+
     # Detach scratch buffers so Jittor GC can free them
     geomBuffer = geomBuffer.detach()
     binningBuffer = binningBuffer.detach()
     imgBuffer = imgBuffer.detach()
 
-    n_contrib = jt.zeros([H, W], dtype='int32')
     return (num_rendered_val, n_contrib, out_color, out_depth, out_opacity,
             out_norm, out_alpha, out_extra, radii,
             geomBuffer, binningBuffer, imgBuffer)
@@ -541,6 +588,23 @@ float* ex_p = (in6_shape0 != 0) ? in6_p : nullptr;
 float* gx_p = (in15_shape0 != 0) ? in15_p : nullptr;
 float* dx_p = (out11_shape0 != 0 && data["ED"] > 0) ? out11_p : nullptr;
 float* ds_p = (out8_shape0 != 0 && data["M"] > 0) ? out8_p : nullptr;
+// jt.code uses the supplied Vars as output contracts; it does not promise
+// that their prior jt.zeros producer initializes the storage handed to this
+// CUDA call.  The raster backward preprocess kernel returns immediately for
+// radii <= 0, so those rows otherwise retain allocator contents.  PyTorch's
+// extension supplies zero-initialized gradient tensors for the same contract.
+cudaMemset(out0_p, 0, (size_t)data["P"] * 3 * sizeof(float));
+cudaMemset(out1_p, 0, (size_t)data["P"] * 4 * sizeof(float));
+cudaMemset(out2_p, 0, (size_t)data["P"] * sizeof(float));
+cudaMemset(out3_p, 0, (size_t)data["P"] * 3 * sizeof(float));
+cudaMemset(out4_p, 0, (size_t)data["P"] * sizeof(float));
+cudaMemset(out5_p, 0, (size_t)data["P"] * 3 * sizeof(float));
+cudaMemset(out6_p, 0, (size_t)data["P"] * 6 * sizeof(float));
+cudaMemset(out7_p, 0, (size_t)data["P"] * 3 * sizeof(float));
+cudaMemset(out8_p, 0, (size_t)(data["M"] > 0 ? data["P"] * data["M"] * 3 : 1) * sizeof(float));
+cudaMemset(out9_p, 0, (size_t)data["P"] * 3 * sizeof(float));
+cudaMemset(out10_p, 0, (size_t)data["P"] * 4 * sizeof(float));
+cudaMemset(out11_p, 0, (size_t)(data["ED"] > 0 ? data["P"] * data["ED"] : 1) * sizeof(float));
 CudaRasterizer::Rasterizer::backward(
     data["P"], data["D"], data["M"], data["R"], data["ED"],
     in0_p, data["W"], data["H"],
@@ -561,7 +625,7 @@ CudaRasterizer::Rasterizer::backward(
             o.compile_options = proj_options
         jt.sync()
 
-    # Gradients exported via return value — direct_backward.py reads them via .numpy()
+    # Gradients are returned to the owning jt.Function and remain in Jittor autograd.
 
     return (outputs[0], outputs[3], outputs[2], outputs[5], outputs[6], outputs[7],
             outputs[8], outputs[9], outputs[10], outputs[11])
@@ -579,16 +643,14 @@ def RasterizeGaussiansFilterCUDA(
     M = 0
     pre = 1 if prefiltered else 0
     dbg = 1 if debug else 0
-    # M3 (blocked by precompiled .so): the guide's "allocate only exact GeometryState
-    # + radii" and dummy/small binning+image buffers reliably crash with
-    # cudaErrorIllegalAddress on a clean GPU — the precompiled libCudaRasterizer.so
-    # (Jul 20) DOES write past small binning/image buffers, contradicting the current
-    # C++ source analysis. Proper M3 needs the visible_filter signature cleanup +
-    # .so rebuild (risky on sm_89; main-project note: rebuilds give all-zero output).
-    # Python side stays at the original generous sizes which are verified working.
-    gsz = P * 256 + 65536
-    bsz = P * 128 + 65536
-    isz = H * W * 32 + 4096
+    # The production library is rebuilt from the controlled source beside this
+    # wrapper.  ``visible_filter`` requests GeometryState and ImageState through
+    # the callbacks; allocate both with the same native ``required<T>`` template.
+    # The current source does not request BinningState, but retain a one-byte
+    # sentinel because the ABI still carries the callback.
+    gsz = query_state_size('GeometryState', P)
+    bsz = 1
+    isz = query_state_size('ImageState', H * W)
 
     with jt.flag_scope(compile_options=proj_options):
         geomBuf = jt.zeros([gsz], dtype='uint8')

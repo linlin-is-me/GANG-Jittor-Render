@@ -2,6 +2,7 @@
 import jittor as jt
 from jittor import nn
 from SDF.utils import spec_gaussian_filter, fftfreqs, img, grid_interp, point_rasterize
+from SDF.fft3d import fft3d, hermitian_expand_last_axis
 import numpy as np
 
 class DPSR(nn.Module):
@@ -32,33 +33,40 @@ class DPSR(nn.Module):
         assert(V.shape == N.shape) # [b, nv, ndims]
         ras_p = point_rasterize(V, N, self.res)  # [b, n_dim, dim0, dim1, dim2]
 
-        # FFT via numpy (DPSR only used for SDF init, not in gradient path)
-        ras_p_np = ras_p.numpy()
-        ras_s_np = np.fft.rfftn(ras_p_np, axes=(2,3,4))
-        ras_s_np = np.transpose(ras_s_np, tuple([0]+list(range(2, self.dim+1))+[self.dim+1, 1]))
-        N_np = ras_s_np[..., None] * self.G.numpy()  # [b, dim0, dim1, dim2/2+1, n_dim, 1]
+        batch, n_dim = ras_p.shape[:2]
+        ras_complex = jt.stack([ras_p, jt.zeros_like(ras_p)], dim=-1)
+        ras_s = fft3d(ras_complex.reshape((batch * n_dim, *self.res, 2)))
+        half_width = self.res[-1] // 2 + 1
+        ras_s = ras_s[:, :, :, :half_width]
+        ras_s = ras_s.reshape((batch, n_dim, self.res[0], self.res[1], half_width, 2))
+        ras_s = ras_s.permute([0, 2, 3, 4, 1, 5])
 
-        omega_np = self.omega.numpy()[..., None] * (2 * np.pi)  # [dim0, dim1, dim2/2+1, n_dim, 1]
-        omega_sq = omega_np.squeeze(-1)  # [dim0, dim1, dim2/2+1, n_dim]
+        # Gaussian filter is real and has shape [D,H,W,1,1].
+        filtered = ras_s * self.G
+        omega = self.omega.unsqueeze(-1) * (2.0 * np.pi)  # [D,H,W,n_dim,1]
 
-        DivN_np = np.sum((-1j * N_np[..., 0]) * omega_sq, axis=-1)  # [b, dim0, dim1, dim2/2+1]
-        Lap_np = -np.sum(omega_sq ** 2, axis=-1)  # [dim0, dim1, dim2/2+1]
-        Phi_np = DivN_np / (Lap_np + 1e-6)  # [b, dim0, dim1, dim2/2+1]
+        # -i * (a + ib) = b - ia.  Summing over the vector dimension gives
+        # the Fourier-domain divergence as a real/imaginary pair.
+        minus_i_filtered = jt.stack([filtered[..., 1], -filtered[..., 0]], dim=-1)
+        div_n = jt.sum(minus_i_filtered * omega, dim=-2)
+        lap = -jt.sum(omega ** 2, dim=-2)
+        phi_freq = div_n / (lap + 1e-6)
 
-        # Permute and zero DC component
-        Phi_np = np.transpose(Phi_np, tuple(list(range(1, self.dim+1)) + [0]))  # [dim0, dim1, dim2/2+1, b]
-        Phi_np[tuple([0] * self.dim)] = 0
-        Phi_np = np.transpose(Phi_np, tuple([self.dim] + list(range(self.dim))))  # [b, dim0, dim1, dim2/2+1]
-
-        phi_np = np.fft.irfftn(Phi_np, s=self.res, axes=(1,2,3))
-        phi = jt.array(phi_np)
+        half_res = (self.res[0], self.res[1], half_width)
+        dc_mask_np = np.ones(half_res, dtype=np.float32)
+        dc_mask_np[(0,) * self.dim] = 0.0
+        dc_mask = jt.array(dc_mask_np).unsqueeze(0).unsqueeze(-1)
+        dc_mask.requires_grad = False
+        phi_freq = phi_freq * dc_mask
+        phi_freq_full = hermitian_expand_last_axis(phi_freq, self.res[-1])
+        phi = fft3d(phi_freq_full, inverse=True)[..., 0]
         
         if self.shift or self.scale:
             # ensure values at points are zero
             fv = grid_interp(phi.unsqueeze(-1), V, batched=True).squeeze(-1) # [b, nv]
             if self.shift: # offset points to have mean of 0
                 offset = jt.mean(fv, dim=-1)  # [b,] 
-                phi -= offset.view(*tuple([-1] + [1] * self.dim))
+                phi = phi - offset.view(*tuple([-1] + [1] * self.dim))
                 
             phi = phi.permute(*tuple([list(range(1,self.dim+1)) + [0]]))
             fv0 = phi[tuple([0] * self.dim)]  # [b,]

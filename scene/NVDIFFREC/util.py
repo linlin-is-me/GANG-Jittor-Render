@@ -12,6 +12,7 @@ import numpy as np
 import jittor as jt
 import jittor.nn as F
 import imageio
+from .texture.jittor_texture import texture as _jittor_texture
 
 
 #----------------------------------------------------------------------------
@@ -95,7 +96,7 @@ def tex_2d(tex_map : jt.Var, coords : jt.Var, filter='nearest') -> jt.Var:
 #----------------------------------------------------------------------------
 
 def _texture_2d_sample_jt(tex, uvs, filter_mode='linear'):
-    """Sample 2D texture with UV coordinates using F.grid_sample.
+    """Sample a 2D texture with nvdiffrast's default periodic boundary mode.
 
     Args:
         tex: [1, H, W, C] texture in NHWC format
@@ -104,14 +105,13 @@ def _texture_2d_sample_jt(tex, uvs, filter_mode='linear'):
     Returns:
         [1, H', W', C] sampled texture
     """
-    # NHWC -> NCHW for grid_sample
-    tex_nchw = tex.permute(0, 3, 1, 2)
-    # UV [0,1] -> [-1,1] for grid_sample
-    grid = uvs * 2.0 - 1.0
-    mode = 'bilinear' if filter_mode == 'linear' else 'nearest'
-    sampled = F.grid_sample(tex_nchw, grid, mode=mode, padding_mode='border', align_corners=False)
-    # NCHW -> NHWC
-    return sampled.permute(0, 2, 3, 1)
+    return _jittor_texture(
+        tex,
+        uvs,
+        filter_mode=filter_mode,
+        boundary_mode='wrap',
+        max_mip_level=0,
+    )
 
 
 def _cubemap_sample_jt(cm, dirs):
@@ -278,19 +278,23 @@ def avg_pool_nhwc(x  : jt.Var, size) -> jt.Var:
 #----------------------------------------------------------------------------
 
 def segment_sum(data: jt.Var, segment_ids: jt.Var) -> jt.Var:
-    num_segments = jt.unique_consecutive(segment_ids).shape[0]  # TODO: verify jt.unique_consecutive exists; if not, implement manually
-
-    # Repeats ids until same dimension as data
-    if len(segment_ids.shape) == 1:
-        s = jt.prod(jt.array(data.shape[1:], dtype=jt.int64)).long()
-        segment_ids = segment_ids.repeat_interleave(s).view(segment_ids.shape[0], *data.shape[1:])
-
-    assert data.shape == segment_ids.shape, "data.shape and segment_ids.shape should be equal"
-
-    shape = [num_segments] + list(data.shape[1:])
-    result = jt.zeros(*shape, dtype=jt.float32)
-    result = result.scatter_add(0, segment_ids, data)
-    return result
+    if segment_ids.ndim != 1:
+        raise ValueError("segment_sum expects one segment id per leading data row")
+    if int(segment_ids.shape[0]) != int(data.shape[0]):
+        raise ValueError("segment id count must equal the leading data dimension")
+    count = int(segment_ids.shape[0])
+    if count == 0:
+        return jt.zeros([0, *list(data.shape[1:])], dtype=data.dtype)
+    ids = segment_ids.int32()
+    if not bool((ids >= 0).all().item()):
+        raise ValueError("segment ids must be non-negative")
+    if count > 1 and not bool((ids[1:] >= ids[:-1]).all().item()):
+        raise ValueError("segment ids must be sorted")
+    num_segments = int(ids[-1].item()) + 1
+    expanded = ids.reshape([count, *([1] * (data.ndim - 1))])
+    expanded = expanded.broadcast(list(data.shape)).int32()
+    result = jt.zeros([num_segments, *list(data.shape[1:])], dtype=data.dtype)
+    return jt.scatter(result, 0, expanded, data, reduce="add")
 
 #----------------------------------------------------------------------------
 # Matrix helpers.

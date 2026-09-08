@@ -1,8 +1,12 @@
-"""Deterministic emitter samples shared by visibility and BRDF evaluation.
+"""N4 (§21): deterministic emitter-sample positions shared by the shadow-context
+builder and the BRDF branch. Pure NumPy — no jittor, no side effects.
 
-The context builder and the BRDF branch must consume identical sample
-positions. This pure-NumPy module is their single source of truth and has no
-Jittor dependency or side effects.
+The old area-light branch recomputed its golden-angle disk from a hardcoded
+`_scene=[0,1.45,1.0]` inside `light.py`, so the context builder and the BRDF
+could drift apart. This module is the single source of truth; `_relight_views.py`
+builds the context list from `make_emitter_samples` and `light.py` consumes the
+same positions (guide §21 N4: "context 构建器和 BRDF 分支必须使用同一组显式
+sample positions；不可在两处各算一遍圆盘采样").
 """
 import hashlib
 import numpy as np

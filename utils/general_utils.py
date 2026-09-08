@@ -34,7 +34,10 @@ def inverse_sigmoid(x):
 
 def PILtoTorch(pil_image, resolution):
     resized_image_PIL = pil_image.resize(resolution)
-    resized_image = jt.array(np.array(resized_image_PIL)) / 255.0
+    # Jittor promotes uint8 / scalar to float16 even with amp_level=0.  Cast
+    # before normalization so RGB supervision retains the source's 8-bit
+    # values exactly in float32, matching torch.from_numpy(...)/255.0.
+    resized_image = jt.array(np.array(resized_image_PIL)).float32() / 255.0
     if len(resized_image.shape) == 3:
         return resized_image.permute(2, 0, 1)
     else:

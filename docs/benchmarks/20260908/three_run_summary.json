@@ -1,0 +1,811 @@
+{
+  "timings": [
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "per_process_means_ms": [
+        87.87375160803397,
+        87.85231783986092,
+        87.7635012070338
+      ],
+      "process_mean_sd_ms": 0.0584564675713791,
+      "relative_range": 0.0012562215440800617,
+      "count": 360,
+      "mean_ms": 87.82985688497622,
+      "fps": 11.385649885660413,
+      "p50_ms": 87.88067474961281,
+      "p95_ms": 93.85210424661636,
+      "sampled_peak_gib": 8.12554931640625
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "per_process_means_ms": [
+        59.527625081439815,
+        59.660460179050766,
+        59.69858101258675
+      ],
+      "process_mean_sd_ms": 0.08974435126244669,
+      "relative_range": 0.002871875552116347,
+      "count": 360,
+      "mean_ms": 59.628888757692444,
+      "fps": 16.770394700186237,
+      "p50_ms": 59.278763830661774,
+      "p95_ms": 64.92700353264809,
+      "sampled_peak_gib": 4.82867431640625
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "per_process_means_ms": [
+        5.4612986743450165,
+        5.466215622921784,
+        5.443407408893108
+      ],
+      "process_mean_sd_ms": 0.012003391117757212,
+      "relative_range": 0.004190061907071916,
+      "count": 360,
+      "mean_ms": 5.456973902053303,
+      "fps": 183.25174683788183,
+      "p50_ms": 5.466591566801071,
+      "p95_ms": 5.799217522144318,
+      "sampled_peak_gib": 1.87164306640625
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "per_process_means_ms": [
+        4.244251983861129,
+        4.261665046215057,
+        4.219233306745688
+      ],
+      "process_mean_sd_ms": 0.02132917196214638,
+      "relative_range": 0.010056741683738917,
+      "count": 360,
+      "mean_ms": 4.241716778940624,
+      "fps": 235.75359980770608,
+      "p50_ms": 4.227902740240097,
+      "p95_ms": 4.592138901352882,
+      "sampled_peak_gib": 1.86773681640625
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "per_process_means_ms": [
+        57.28945676237345,
+        58.436658481756844,
+        57.10349871466557
+      ],
+      "process_mean_sd_ms": 0.7220303715973919,
+      "relative_range": 0.023346376265888702,
+      "count": 360,
+      "mean_ms": 57.609871319598625,
+      "fps": 17.35813632445668,
+      "p50_ms": 57.671137154102325,
+      "p95_ms": 61.64179928600788,
+      "sampled_peak_gib": 4.82867431640625
+    }
+  ],
+  "third_run_image_checks": [
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC07956",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC07957",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC07966",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC07975",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC07984",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC07993",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08002",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08011",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08020",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08021",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08030",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08039",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08048",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08057",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08066",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08075",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08084",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08085",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08094",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08103",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08112",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08121",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08130",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "pytorch",
+      "view": "DSC08139",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC07956",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC07957",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC07966",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC07975",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC07984",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC07993",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08002",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08011",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08020",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08021",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08030",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08039",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08048",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08057",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08066",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08075",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08084",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08085",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08094",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08103",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08112",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08121",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08130",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "full",
+      "family": "local",
+      "view": "DSC08139",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC07956",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC07957",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC07966",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC07975",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC07984",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC07993",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08002",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08011",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08020",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08021",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08030",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08039",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08048",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08057",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08066",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08075",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08084",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08085",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08094",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08103",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08112",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08121",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08130",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "pytorch",
+      "view": "DSC08139",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC07956",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC07957",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC07966",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC07975",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC07984",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC07993",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08002",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08011",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08020",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08021",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08030",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08039",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08048",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08057",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08066",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08075",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08084",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08085",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08094",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08103",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08112",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08121",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08130",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "raster",
+      "family": "local",
+      "view": "DSC08139",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC07956",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC07957",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC07966",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC07975",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC07984",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC07993",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08002",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08011",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08020",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08021",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08030",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08039",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08048",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08057",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08066",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08075",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08084",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08085",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08094",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08103",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08112",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08121",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08130",
+      "max_abs": 0.0
+    },
+    {
+      "mode": "rgb",
+      "family": "local",
+      "view": "DSC08139",
+      "max_abs": 0.0
+    }
+  ]
+}

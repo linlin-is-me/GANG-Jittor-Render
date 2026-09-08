@@ -13,6 +13,40 @@ import jittor as jt
 import numpy as np
 import cv2
 
+
+def reference_metric_inputs_numpy(img1, img2):
+    """Return FP32 metric inputs using GANG training-evaluation clipping.
+
+    Raw render artifacts remain untouched; only PSNR/SSIM inputs are clipped.
+    """
+    lhs = np.asarray(img1, dtype=np.float32)
+    rhs = np.asarray(img2, dtype=np.float32)
+    if lhs.shape != rhs.shape or lhs.ndim != 3:
+        raise ValueError(
+            f"metric inputs must be same-shape CHW arrays, got {lhs.shape} and {rhs.shape}")
+    return np.clip(lhs, 0.0, 1.0), np.clip(rhs, 0.0, 1.0)
+
+
+def channelwise_psnr_numpy(img1, img2):
+    """Match GANG-master ``psnr(...).mean()`` for CHW images.
+
+    The reference computes one MSE and PSNR per channel before averaging the
+    channel scores.  Computing a single MSE over all channels is generally not
+    equivalent.
+    """
+    lhs = np.asarray(img1, dtype=np.float64)
+    rhs = np.asarray(img2, dtype=np.float64)
+    if lhs.shape != rhs.shape or lhs.ndim != 3:
+        raise ValueError(
+            f"PSNR inputs must be same-shape CHW arrays, got {lhs.shape} and {rhs.shape}")
+    channel_mse = ((lhs - rhs) ** 2).reshape(lhs.shape[0], -1).mean(axis=1)
+    channel_psnr = np.where(
+        channel_mse == 0.0,
+        99.0,
+        -10.0 * np.log10(np.maximum(channel_mse, np.finfo(np.float64).tiny)),
+    )
+    return float(channel_psnr.mean())
+
 def mse(img1, img2):
     return (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
 

@@ -241,23 +241,24 @@ def build_rotation(r):
 
     q = r / norm[:, None]
 
-    R = jt.zeros((q.size(0), 3, 3))
-
     r = q[:, 0]
     x = q[:, 1]
     y = q[:, 2]
     z = q[:, 3]
 
-    R[:, 0, 0] = 1 - 2 * (y*y + z*z)
-    R[:, 0, 1] = 2 * (x*y - r*z)
-    R[:, 0, 2] = 2 * (x*z + r*y)
-    R[:, 1, 0] = 2 * (x*y + r*z)
-    R[:, 1, 1] = 1 - 2 * (x*x + z*z)
-    R[:, 1, 2] = 2 * (y*z - r*x)
-    R[:, 2, 0] = 2 * (x*z - r*y)
-    R[:, 2, 1] = 2 * (y*z + r*x)
-    R[:, 2, 2] = 1 - 2 * (x*x + y*y)
-    return R
+    # Build the matrix as a pure expression.  Nine lazy in-place writes to a
+    # shared zero Var do not encode a safe execution dependency in Jittor and
+    # produced one-ULP cross-process changes in the phase-two normal decoder.
+    row0 = jt.stack((1 - 2 * (y*y + z*z),
+                     2 * (x*y - r*z),
+                     2 * (x*z + r*y)), dim=1)
+    row1 = jt.stack((2 * (x*y + r*z),
+                     1 - 2 * (x*x + z*z),
+                     2 * (y*z - r*x)), dim=1)
+    row2 = jt.stack((2 * (x*z - r*y),
+                     2 * (y*z + r*x),
+                     1 - 2 * (x*x + y*y)), dim=1)
+    return jt.stack((row0, row1, row2), dim=1)
 
 def flip_align_view(normal, viewdir):
     # normal: (N, 3), viewdir: (N, 3)

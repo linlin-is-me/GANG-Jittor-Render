@@ -14,10 +14,10 @@ from datetime import timedelta
 import jittor as jt
 from functools import reduce
 import numpy as np
-# torch_scatter.scatter_max replaced with native torch.scatter_reduce (Windows compat)
+# Scatter reductions are implemented with Jittor operators below.
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
-from utils.jt_safe import path_log
-from jittor import nn  # TODO: verify each import is valid in Jittor
+from utils.jt_safe import first_non_finite, path_log
+from jittor import nn
 import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
@@ -27,10 +27,6 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation,build_ro
 from scene.embedding import Embedding
 import math
 from utils.graphics_utils import fibonacci_sphere_sampling,get_minimum_axis,flip_align_view
-try:
-    import open3d as o3d
-except ImportError:
-    o3d = None
 from utils.general_utils import quaternion2rotmat
 # from submodules.permuto_sdf.permuto_sdf_py.models.models import SDF
 # from submodules.permuto_sdf.permuto_sdf_py.utils.common_utils import create_bb_for_dataset
@@ -48,10 +44,10 @@ def jt_quantile(x, q):
     sorted_x, _ = jt.sort(x.reshape(-1))  # jt.sort returns (value, index)
     n = sorted_x.shape[0]
     idx = q * (n - 1)
-    lo = int(jt.floor(idx).numpy())
+    lo = int(math.floor(idx))
     hi = min(lo + 1, n - 1)
     frac = idx - float(lo)
-    return float(sorted_x[lo].numpy()) + frac * (float(sorted_x[hi].numpy()) - float(sorted_x[lo].numpy()))
+    return sorted_x[lo] + frac * (sorted_x[hi] - sorted_x[lo])
 
 
 def _jt_bool_to_np_indices(mask):
@@ -71,6 +67,24 @@ def _jt_bool_to_np_indices(mask):
 def _jt_safe_unique_2d(coords):
     """Compute unique rows via jt.unique(dim=0). Jittor 1.3.11 uses thrust::sort+unique."""
     return jt.unique(coords, return_inverse=True, dim=0)
+
+
+def _normalized_densification_gradients(numerator, denominator, policy):
+    numerator = numerator.reshape(-1, 1)
+    denominator = denominator.reshape(-1, 1)
+    if policy == "source_divide_then_zero_invalid":
+        divided = numerator / denominator
+        return jt.where(divided.isfinite(), divided, 0.0)
+    if policy == "epsilon_1e-8":
+        return numerator / (denominator + 1e-8)
+    raise ValueError(f"unsupported densification gradient division policy: {policy}")
+
+
+def _stable_rotation_activation(rotation, threshold=2.5e-6):
+    """Normalize quaternions while suppressing ill-conditioned tiny-row gradients."""
+    near_zero = jt.norm(rotation, dim=-1, keepdims=True) < threshold
+    conditioned = jt.where(near_zero, rotation.detach(), rotation)
+    return jt.normalize(conditioned)
 
 
 # sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../submodules/permuto_sdf/permuto_sdf_py/models')))
@@ -99,7 +113,8 @@ class ClipLayer(nn.Module):
 
     def execute(self, x):
         return x.maximum(self.min_val).minimum(self.max_val)
-    
+
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -117,7 +132,7 @@ class GaussianModel:
         self.opacity_activation = jt.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
 
-        self.rotation_activation = jt.normalize
+        self.rotation_activation = _stable_rotation_activation
 
 
     def __init__(self, 
@@ -178,6 +193,8 @@ class GaussianModel:
         
         self.start_step = 0
         self.end_step = 0
+        self.init_pos = None
+        self.cam_infos = jt.empty((0, 4), dtype=jt.float32)
 
         self._anchor = jt.empty(0)
         self._level = jt.empty(0)
@@ -186,7 +203,7 @@ class GaussianModel:
         self.opacity_accum = jt.empty(0)
         self._scaling = jt.empty(0)
         self._rotation = jt.empty(0)
-        self._opacity = jt.empty(0)
+        self._opacity = jt.empty(0).stop_grad()
         
         self.offset_gradient_accum = jt.empty(0)
         self.offset_denom = jt.empty(0)
@@ -194,6 +211,7 @@ class GaussianModel:
         self.anchor_demon = jt.empty(0)
                 
         self.optimizer = None
+        self._saved_training_args = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
@@ -318,7 +336,9 @@ class GaussianModel:
             self.embedding_appearance.train()
 
 
-    def capture(self):
+    def capture(self, include_optimizer=True):
+        if include_optimizer and self.optimizer is None:
+            raise RuntimeError("cannot capture optimizer state before training setup")
         capture_list = [
             self._anchor,
             self._level,
@@ -331,7 +351,7 @@ class GaussianModel:
             self.offset_gradient_accum,
             self.offset_denom,
             self.anchor_demon,
-            self.optimizer.state_dict(),
+            self.optimizer.state_dict() if include_optimizer else None,
             self.spatial_lr_scale,
             self.mlp_opacity.state_dict(),
             self.mlp_cov.state_dict(),
@@ -363,10 +383,8 @@ class GaussianModel:
     def capture_numpy(self, skip_sync=False, light=None):
         """Capture all state as numpy arrays.
 
-        NOTE: Jittor 1.3.11 — after rasterizer backward, tensors become CUDA-only
-        and .numpy()/.data/jt.sync()/cupy all fail. We work around this by reading
-        MLP weights BEFORE backward (caller must invoke at the right time).
-        For params that fail, we return zeros as placeholder.
+        Every tensor must materialize successfully.  This helper never substitutes
+        zeros or stale CPU shadows for model state.
 
         Args:
             skip_sync: If True, skip jt.sync_all() to avoid SFRL crash after
@@ -382,10 +400,10 @@ class GaussianModel:
                 try:
                     jt.sync_all()
                     return obj.numpy()
-                except:
-                    pass
-                path_log("[FALLBACK] capture_numpy: .numpy() failed, using zeros")
-                return np.zeros(obj.shape, dtype=np.float32)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"capture_numpy failed to materialize Var with shape {tuple(obj.shape)}"
+                    ) from exc
             if isinstance(obj, dict):
                 return {k: _to_np(v) for k, v in obj.items()}
             if isinstance(obj, (list, tuple)):
@@ -421,17 +439,13 @@ class GaussianModel:
                                 if diff > 1e-10:
                                     from utils.general_utils import path_log
                                     path_log(f"[P31] {mlp_attr}/{param_names[pi]}: direct vs _to_np diff={diff:.6e}")
-                        except Exception:
-                            # fallback: keep whatever _to_np produced
-                            orig = result[mlp_idx]
-                            if isinstance(orig, dict) and param_names[pi] in orig:
-                                fresh_dict[param_names[pi]] = orig[param_names[pi]]
-                            else:
-                                fresh_dict[param_names[pi]] = np.zeros(tuple(p.shape), dtype=np.float32)
+                        except Exception as exc:
+                            raise RuntimeError(
+                                f"capture_numpy failed to read {mlp_attr}/{param_names[pi]}"
+                            ) from exc
                 result[mlp_idx] = fresh_dict
-        except Exception as e:
-            from utils.general_utils import path_log
-            path_log(f"[capture_numpy] MLP re-read failed: {e}")
+        except Exception as exc:
+            raise RuntimeError("capture_numpy failed to re-read MLP parameters") from exc
 
         # Phase 64: append Hybridlight state for PBR checkpoint persistence
         if light is not None:
@@ -443,18 +457,18 @@ class GaussianModel:
                     'roughness': light.roughness.numpy().astype(np.float32),
                 }
                 result.append(light_np)
-            except Exception as e:
-                from utils.general_utils import path_log
-                path_log(f"[capture_numpy] light capture failed: {e}")
-                result.append(None)
+            except Exception as exc:
+                raise RuntimeError("capture_numpy failed to read Hybridlight state") from exc
 
         return result
 
-    def restore_numpy(self, np_data, metadata=None):
-        """Restore from numpy-captured state. Rebuilds optimizer (JGaussian pattern).
+    def restore_numpy(
+        self, np_data, metadata=None, *, inference_only=False, build_optimizer=True,
+    ):
+        """Restore numpy-captured state for training or optimizer-free inference.
 
-        Returns light_state. It is None for non-PBR checkpoints, or a dict with
-        'base', 'lgtSGs', 'specular_reflectance' and 'roughness'.
+        Phase 64: Returns (model_restored, light_state) tuple. light_state is None
+        for non-PBR checkpoints, or a dict with 'base','lgtSGs','specular_reflectance','roughness'.
 
         Named inference checkpoints may pass octree metadata separately.  Install
         it before restore() so its fallback reconstruction cannot replace exact
@@ -482,10 +496,9 @@ class GaussianModel:
                 return None
             if isinstance(obj, np.ndarray):
                 if obj.dtype == np.object_:
-                    # Object array from pickle — extract scalar or list
-                    if obj.ndim == 0:
-                        return _to_jt(obj.item())
-                    return [_to_jt(v) for v in obj]
+                    raise TypeError(
+                        "object arrays are forbidden in GaussianModel.restore_numpy; "
+                        "convert legacy checkpoints with the isolated converter")
                 return jt.array(obj)
             if isinstance(obj, dict):
                 return {k: _to_jt(v) for k, v in obj.items()}
@@ -498,7 +511,8 @@ class GaussianModel:
                 return float(obj)
             if isinstance(obj, (int, float, str, bool)):
                 return obj
-            return None
+            raise TypeError(
+                f"unsupported Gaussian restore value: {type(obj).__name__}")
 
         def _meta_scalar(value):
             if isinstance(value, np.ndarray) and value.shape == ():
@@ -514,12 +528,31 @@ class GaussianModel:
             for key in ('levels', 'init_level'):
                 if key in metadata and metadata[key] is not None:
                     setattr(self, key, int(_meta_scalar(metadata[key])))
+            if metadata.get('schema') == 'gang.gaussian_topology_metadata.v2':
+                init_pos = np.asarray(metadata['init_pos'], dtype=np.float32)
+                cam_infos = np.asarray(metadata['cam_infos'], dtype=np.float32)
+                centroid = np.asarray(metadata['centroid'], dtype=np.float32)
+                if init_pos.shape != (1,) or centroid.shape != (3,):
+                    raise ValueError(
+                        "checkpoint init_pos/centroid must have shapes [1] and [3]")
+                if cam_infos.ndim != 2 or cam_infos.shape[1] != 4:
+                    raise ValueError("checkpoint cam_infos must have shape [C,4]")
+                if not (np.isfinite(init_pos).all() and np.isfinite(cam_infos).all()
+                        and np.isfinite(centroid).all()):
+                    raise ValueError("checkpoint topology metadata contains NaN or Inf")
+                self.init_pos = jt.array(init_pos, dtype=jt.float32)
+                self.cam_infos = jt.array(cam_infos, dtype=jt.float32)
+                self.centroid = jt.array(centroid, dtype=jt.float32)
+                self.visible_threshold = float(
+                    _meta_scalar(metadata['visible_threshold']))
 
         model_args = _to_jt(np_data)
         # restore() extracts training_args_dict from model_args[-1],
         # reconstructs Namespace, calls training_setup(training_args)
         # which creates a fresh optimizer with correct param references.
-        self.restore(model_args, None)
+        self.restore(
+            model_args, None, inference_only=inference_only,
+            build_optimizer=build_optimizer)
 
         if metadata and metadata.get('_extra_level') is not None:
             extra_level = np.asarray(metadata['_extra_level'], dtype=np.float32).reshape(-1)
@@ -530,11 +563,19 @@ class GaussianModel:
             self._extra_level_np = extra_level
             self._extra_level = jt.array(extra_level, dtype=jt.float32)
 
-        print("[checkpoint] Restored from numpy checkpoint (optimizer rebuilt)")
+        mode = (
+            "inference without optimizer" if inference_only
+            else "training with optimizer" if build_optimizer
+            else "training state without optimizer"
+        )
+        print(f"[checkpoint] Restored from numpy checkpoint ({mode})")
         return light_state
 
 
-    def restore(self, model_args, training_args= None):
+    def restore(
+        self, model_args, training_args=None, *, inference_only=False,
+        build_optimizer=True,
+    ):
         # Backward compat: old checkpoints have 17 items (no use_feat_bank/appearance None pads).
         # Pad to 19 items if needed so we can unpack uniformly.
         if len(model_args) < 19:
@@ -562,28 +603,35 @@ class GaussianModel:
         print("Load model_args Size:",len(model_args))
 
         # Reconstruct training_args from saved dict (JGaussian pattern)
-        if training_args is None and isinstance(training_args_dict, dict) and training_args_dict:
+        if (training_args is None and isinstance(training_args_dict, dict)
+                and training_args_dict):
             from argparse import Namespace
             training_args = Namespace(**training_args_dict)
+        self._saved_training_args = training_args
 
         # Always rebuild optimizer from scratch (momentum reset).
         # Avoids state_dict incompatibility after densification.
         # reset_stats=False preserves densification accumulators from checkpoint.
-        if training_args is not None:
-            # Enable gradient tracking on restored tensors (jt.array(numpy) defaults to stop_grad)
+        if inference_only or not build_optimizer:
+            self.optimizer = None
+        if not inference_only:
+            # Checkpoint arrays default to stop-grad.  Production trainers build
+            # the named optimizer separately, but the restored leaves must be
+            # trainable before that transaction.
             self._anchor.requires_grad = True
             self._offset.requires_grad = True
             self._anchor_feat.requires_grad = True
             self._scaling.requires_grad = True
             self._rotation.requires_grad = True
-            self._opacity.requires_grad = False
+            self._opacity.stop_grad()
+        if not inference_only and build_optimizer and training_args is not None:
             self.training_setup(training_args, reset_stats=False)
             # Restore optimizer momentum/variance (JGaussian pattern)
             if opt_dict is not None and isinstance(opt_dict, dict) and 'defaults' in opt_dict:
                 try:
                     self.optimizer.load_state_dict(opt_dict)
                 except Exception as e:
-                    print(f"[checkpoint] Optimizer state restore failed: {e}")
+                    raise RuntimeError("legacy optimizer state restore failed") from e
 
 
         self.mlp_opacity.load_state_dict(mlp_opacity)
@@ -632,26 +680,47 @@ class GaussianModel:
         # created by training_setup with correct param references.
         # Old opt_dict would be incompatible after densification (param count change).
 
-        # CRITICAL: Sync numpy shadows after restore.
-        # set_anchor_mask() relies on _anchor_np/_level_np/_extra_level_np
-        # to compute per-view LOD filtering. Without this sync, shadows are
-        # never initialized after checkpoint load → AttributeError or all-black render.
-        self._sync_np_shadows()
-
-        # _extra_level is NOT saved in checkpoint (not a trainable param).
-        # Initialize with zeros = no extra level adjustment to LOD computation.
+        # Install a shape-correct placeholder before the first strict mirror sync.
+        # restore_numpy() replaces it with the exact checkpoint metadata directly
+        # after this method returns.
         N = self._anchor.shape[0]
-        if not hasattr(self, '_extra_level_np') or self._extra_level_np is None \
-           or self._extra_level_np.shape[0] != N:
-            self._extra_level_np = np.zeros(N, dtype=np.float32)
         if not hasattr(self, '_extra_level') or self._extra_level is None \
            or self._extra_level.shape[0] != N:
-            self._extra_level = jt.array(self._extra_level_np, dtype=jt.float32)
+            self._extra_level = jt.zeros(N, dtype=jt.float32)
+
+        # set_anchor_mask() relies on exact CPU mirrors for LOD filtering.
+        self._sync_np_shadows()
 
         # _anchor_mask defaults to all-visible (GPU bool tensor, Phase 78)
         if not hasattr(self, '_anchor_mask') or self._anchor_mask is None \
            or self._anchor_mask.shape[0] != N:
             self._anchor_mask = jt.ones(N, dtype='bool')
+
+        if inference_only:
+            state_vars = (
+                self._anchor, self._level, self._offset, self._anchor_feat,
+                self.opacity_accum, self._scaling, self._rotation, self._opacity,
+                self.offset_gradient_accum, self.offset_denom, self.anchor_demon,
+                self._extra_level, self._anchor_mask,
+            )
+            for value in state_vars:
+                if isinstance(value, jt.Var):
+                    value.stop_grad()
+            modules = [self.mlp_opacity, self.mlp_cov, self.mlp_color]
+            if self.use_feat_bank:
+                modules.append(self.mlp_feature_bank)
+            if self.appearance_dim > 0:
+                modules.append(self.embedding_appearance)
+            if self.is_pbr:
+                modules.extend([
+                    self.mlp_albedo, self.mlp_matallic, self.mlp_roughness])
+            if self.normal_detal:
+                modules.extend([self.mlp_normal1, self.mlp_normal2])
+            for module in modules:
+                if module is not None:
+                    for parameter in module.parameters():
+                        parameter.stop_grad()
+            self.eval()
 
         # standard_dist, voxel_size, levels are NOT saved in checkpoint
         # (computed during create_from_pcd / set_level / load_ply_sparse_gaussian).
@@ -758,11 +827,11 @@ class GaussianModel:
                 self.coarse_intervals.append(interval)
 
     def set_level(self, points, cameras, scales, dist_ratio=0.95, init_level=-1, levels=-1):
-        """Compute LOD levels using pure Jittor GPU ops (matching PyTorch torch.quantile)."""
-        # Ensure points is a Jittor tensor on GPU
-        if not isinstance(points, jt.Var):
-            points = jt.array(points)
-        pts = points.float32()
+        """Compute one-time LOD statistics with linear host-side quantiles."""
+        if isinstance(points, jt.Var):
+            jt.sync_all()
+            points = points.numpy()
+        pts = np.asarray(points, dtype=np.float32)
 
         all_dist_list = []  # accumulate float scalars
         cam_infos_list = []  # accumulate numpy for final cam_infos tensor
@@ -775,38 +844,39 @@ class GaussianModel:
                 cam_idx += 1
                 if cam_idx == 1 or cam_idx % 20 == 0:
                     print(f"[set_level] camera {cam_idx}/{total_cams}...", flush=True)
-                cam_center = cam.camera_center
-                if isinstance(cam_center, jt.Var):
-                    cc = cam_center
+                # Camera stores this value from the same host-side world-view matrix.
+                # Avoid reading back the GPU inverse Var during initialization.
+                if hasattr(cam, "camera_center_numpy"):
+                    cc_np = np.asarray(cam.camera_center_numpy, dtype=np.float32).reshape(-1)
                 else:
-                    cc = jt.array(cam_center)
+                    cam_center = cam.camera_center
+                    jt.sync_all()
+                    cc_np = np.asarray(cam_center.numpy(), dtype=np.float32).reshape(-1)
                 if cam_idx == 1:
-                    print(f"  [DEBUG] cam0 center: {cc.numpy()}, pts range: [{float(pts.min()):.6f}, {float(pts.max()):.6f}]", flush=True)
+                    print(f"  [DEBUG] cam0 center: {cc_np}", flush=True)
 
-                cam_infos_list.append([float(cc[0].numpy()), float(cc[1].numpy()),
-                                        float(cc[2].numpy()), float(scale)])
+                cam_infos_list.append([float(cc_np[0]), float(cc_np[1]),
+                                        float(cc_np[2]), float(scale)])
 
                 # GPU distance computation (Jittor — matches PyTorch torch.sqrt(torch.sum(...)))
-                dist = jt.norm(pts - cc.float32(), dim=1) + jt.float32(1e-10)
-                dist_max = jt_quantile(dist, dist_ratio)
-                dist_min = jt_quantile(dist, 1.0 - dist_ratio)
+                dist = np.linalg.norm(pts - cc_np[None, :], axis=1) + np.float32(1e-10)
+                dist_max = float(np.quantile(dist, dist_ratio, method="linear"))
+                dist_min = float(np.quantile(dist, 1.0 - dist_ratio, method="linear"))
                 all_dist_list.append(dist_min * scale)
                 all_dist_list.append(dist_max * scale)
                 # 2026-08-06: flush the lazy graph per camera — otherwise all C
                 # cameras' [N] dist Vars + quantile sorts accumulate before one
                 # materialization and OOM on 8GB (0-iter octree build on garden).
                 # Init path only; irrelevant to render/relight hot paths.
-                jt.sync_all(True); jt.gc()
 
         self.cam_infos = jt.array(np.array(cam_infos_list, dtype=np.float32))
 
-        # Final quantile on all accumulated distances
-        all_dist = jt.array(np.array(all_dist_list, dtype=np.float32))
-        dist_max = jt_quantile(all_dist, dist_ratio)
-        dist_min = jt_quantile(all_dist, 1.0 - dist_ratio)
-        self.standard_dist = dist_max
+        all_dist = np.asarray(all_dist_list, dtype=np.float32)
+        dist_max_value = float(np.quantile(all_dist, dist_ratio, method="linear"))
+        dist_min_value = float(np.quantile(all_dist, 1.0 - dist_ratio, method="linear"))
+        self.standard_dist = dist_max_value
         if levels == -1:
-            self.levels = int(round(math.log2(dist_max / max(dist_min, 1e-10)) / math.log2(self.fork))) + 1
+            self.levels = int(round(math.log2(dist_max_value / max(dist_min_value, 1e-10)) / math.log2(self.fork))) + 1
         else:
             self.levels = levels
         if init_level == -1:
@@ -851,13 +921,7 @@ class GaussianModel:
         print(f"Building octree time: {int(time_diff // 60)} min {time_diff % 60} sec")
 
     def create_from_pcd(self, points, spatial_lr_scale, logger=None):
-        # 2026-08-06: the CUDA KNN (simple_knn_jt) does not exist in this repo
-        # copy; the scipy KDTree path below is the primary initializer (Phase 51).
-        # Guard the import so create_from_pcd still runs when it is absent.
-        try:
-            from gaussian_renderer.simple_knn_jt import distCUDA2  # noqa: F401 — fallback only
-        except ImportError:
-            distCUDA2 = None
+        from gaussian_renderer.simple_knn_jt import distCUDA2
         self.spatial_lr_scale = spatial_lr_scale
         # points is numpy array (jt.array doesn't fully copy large arrays to GPU)
         pts_np = points if isinstance(points, np.ndarray) else points.numpy()
@@ -875,8 +939,18 @@ class GaussianModel:
 
         if self.visible_threshold < 0:
             self.visible_threshold = 0.0
-            self.positions, self._level, self.visible_threshold, _ = self.weed_out(self.positions, self._level)
-        self.positions, self._level, _, _ = self.weed_out(self.positions, self._level)
+            _, _, self.visible_threshold, weed_mask = self.weed_out(self.positions, self._level)
+            weed_mask_np = np.asarray(weed_mask.numpy(), dtype=np.bool_).reshape(-1)
+            self.positions_np = self.positions_np[weed_mask_np]
+            self.levels_np = self.levels_np[weed_mask_np]
+            self.positions = jt.array(self.positions_np).float32()
+            self._level = jt.array(self.levels_np).int32()
+        _, _, _, weed_mask = self.weed_out(self.positions, self._level)
+        weed_mask_np = np.asarray(weed_mask.numpy(), dtype=np.bool_).reshape(-1)
+        self.positions_np = self.positions_np[weed_mask_np]
+        self.levels_np = self.levels_np[weed_mask_np]
+        self.positions = jt.array(self.positions_np).float32()
+        self._level = jt.array(self.levels_np).int32()
         jt.sync()  # materialize positions before CUDA kernels (distCUDA2)
 
         print(f'Branches of Tree: {self.fork}')
@@ -901,34 +975,12 @@ class GaussianModel:
 
         offsets = jt.zeros((self.positions.shape[0] * self.n_offsets, 3)).float()
         anchors_feat = jt.zeros((self.positions.shape[0], self.feat_dim)).float()  # match PT: zero init
-        # Compute KNN distances in numpy FIRST (avoids CUDA-only chain: distCUDA2 is jt.code, no CPU version)
-        try:
-            from scipy.spatial import KDTree
-            # 2026-08-06: this repo copy does not set _anchor_np inside weed_out;
-            # derive the numpy anchor grid from self.positions directly (Phase 51
-            # scipy-KDTree initializer) and stash it for the numpy shadow path.
-            anchor_np = (self.positions.numpy() if hasattr(self.positions, 'numpy')
-                         else np.asarray(self.positions))
-            self._anchor_np = np.ascontiguousarray(anchor_np, dtype=np.float32)
-            tree = KDTree(self._anchor_np)
-            dists, _ = tree.query(self._anchor_np, k=4)
-            # KDTree returns actual Euclidean distances.
-            # PT's distCUDA2 returns MEAN OF SQUARED distances.
-            # To match: square → mean → sqrt (RMS of 3 nearest neighbors).
-            sq_dists = dists[:, 1:] ** 2          # [N, 3] squared distances
-            nn_dists = sq_dists.mean(axis=1)       # mean squared distance (matches distCUDA2)
-            nn_dists = np.maximum(nn_dists, 1e-7)
-            # Phase 43: clamp max KNN distance to 3× voxel_size to prevent giant Gaussians.
-            # With sparse anchors, isolated points get huge KNN distances → enormous scales
-            # → blocky mosaic artifacts and coverage gaps.
-            max_nn_dist = float(self.voxel_size) * 3.0
-            nn_dists = np.minimum(nn_dists, max_nn_dist ** 2)  # clamp squared distance
-            _scales_init_np = np.log(np.sqrt(nn_dists))  # log(RMS) — matches distCUDA2
-            self._scaling_np_temp = np.tile(_scales_init_np[:, None], (1, 6))
-            scales = jt.array(self._scaling_np_temp)
-        except Exception:
-            dist2 = jt.maximum(distCUDA2(self.positions).float(), 0.0000001)
-            scales = jt.log(jt.sqrt(dist2))[...,None].repeat(1, 6)
+        # Use the same framework-independent CUDA implementation as the source
+        # project.  A SciPy KDTree and its historical 3x-voxel clamp produced a
+        # different initialization, so production no longer falls back to it.
+        self._anchor_np = np.ascontiguousarray(self.positions_np, dtype=np.float32)
+        dist2 = jt.maximum(distCUDA2(self.positions).float(), 0.0000001)
+        scales = jt.log(jt.sqrt(dist2))[..., None].repeat(1, 6)
         rots = jt.zeros((self.positions.shape[0], 4))
         rots[:, 0] = 1
         opacities = inverse_sigmoid(0.1 * jt.ones((self.positions.shape[0], 1), dtype=jt.float))
@@ -943,8 +995,7 @@ class GaussianModel:
         self._scaling = scales
         rots.requires_grad = True
         self._rotation = rots
-        opacities.requires_grad = False
-        self._opacity = opacities
+        self._opacity = opacities.stop_grad()
         # self._level remains [N] shape (unsqueeze removed — breaks CUDA-compatibility chain)
         self._extra_level_np = np.zeros(self._anchor.shape[0], dtype=np.float32)
         self._extra_level = jt.array(self._extra_level_np)
@@ -962,8 +1013,9 @@ class GaussianModel:
         else:
             self._scaling_np = np.zeros((self._anchor.shape[0], 6), dtype=np.float32)
 
-        # SFRL cleanup: jt.unique/jt.sort in octree_sample/set_level leave GPU alloc fragments
-        jt.sync_all(); jt.gc(); jt.gc()
+        # Materialize initialized parameters once. Do not force repeated global
+        # collection; Jittor owns the lifetime of the preceding temporary graph.
+        jt.sync_all()
 
     def map_to_int_level(self, pred_level, cur_level):
         if self.dist2level=='floor':
@@ -1022,7 +1074,7 @@ class GaussianModel:
         # Match the PyTorch reference: LOD distance is measured from the voxel
         # centre rather than its stored lower-corner anchor.
         voxel_offset = (self.voxel_size * 0.5) * jt.exp(
-            -self._level.float32() * math.log(float(self.fork)))
+            -self._level.float32().reshape(-1, 1) * math.log(float(self.fork)))
         anchor_pos = anchor + voxel_offset
         dist = jt.norm(anchor_pos - cc, dim=1) * resolution_scale + jt.float32(1e-10)
         pred_level = jt.log2(self.standard_dist / jt.maximum(dist, jt.float32(1e-10)))
@@ -1076,7 +1128,7 @@ class GaussianModel:
         else:
             cc = jt.array(cam_center)
         voxel_offset = (self.voxel_size * 0.5) * jt.exp(
-            -self._level.float32() * math.log(float(self.fork)))
+            -self._level.float32().reshape(-1, 1) * math.log(float(self.fork)))
         anchor_pos = anchor + voxel_offset
         dist = jt.norm(anchor_pos - cc, dim=1) * resolution_scale + jt.float32(1e-10)
         pred_level = jt.log2(self.standard_dist / jt.maximum(dist, jt.float32(1e-10)))
@@ -1261,22 +1313,13 @@ class GaussianModel:
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
 
-        anchor = self._anchor_np
-        levels = self._level_np[:, None]  # restore [N,1] shape for PLY concat
-        extra_levels = self._extra_level_np[:, None]
-        infos = np.zeros((anchor.shape[0], 1), dtype=np.float32)
-        infos[0, 0] = self.voxel_size
-        infos[1, 0] = self.standard_dist
-
         from utils.jt_safe import memcpy_to_numpy
 
         _tier_log = {}
 
-        def _copy_or_shadow(tensor, shadow_name, shape, transform=None, label=""):
-            """3-tier fallback: .numpy() → memcpy_to_numpy → numpy shadow → zeros."""
+        def _copy_strict(tensor, transform=None, label=""):
+            """Materialize current geometry; stale CPU shadows are never accepted."""
             t1_error = None
-            t2_error = None
-            # Tier 1: try direct .numpy()
             try:
                 t = tensor.detach()
                 if transform:
@@ -1286,7 +1329,6 @@ class GaussianModel:
                 return val
             except Exception as e1:
                 t1_error = type(e1).__name__
-            # Tier 2: memcpy D2H via jt.code
             try:
                 t = tensor.detach()
                 if transform:
@@ -1295,35 +1337,32 @@ class GaussianModel:
                 _tier_log[label] = "T2"
                 return val
             except Exception as e2:
-                t2_error = type(e2).__name__
-                path_log(f"[FALLBACK] save_ply {label}: T1+T2 failed (T1:{t1_error} T2:{t2_error}), trying T3")
-            # Tier 3: numpy shadow (initial values)
-            s = getattr(self, shadow_name, None)
-            if s is not None and s.shape[0] == anchor.shape[0]:
-                _tier_log[label] = f"T3(shadow) T1:{t1_error} T2:{t2_error}"
-                return np.ascontiguousarray(s)
-            _tier_log[label] = f"T3(zeros) T1:{t1_error} T2:{t2_error}"
-            path_log(f"[FALLBACK] save_ply {label}: T3 shadow also unavailable, using zeros")
-            return np.zeros(shape, dtype=np.float32)
+                raise RuntimeError(
+                    f"save_ply cannot materialize {label}; "
+                    f"direct read={t1_error}, strict fallback={type(e2).__name__}"
+                ) from e2
 
-        anchor_feats = _copy_or_shadow(self._anchor_feat, '_anchor_feat_np',
-                                       (anchor.shape[0], self._anchor_feat.shape[1]),
+        anchor = _copy_strict(self._anchor, label="anchor")
+        levels = _copy_strict(self._level, label="level").reshape(-1, 1)
+        extra_levels = _copy_strict(
+            self._extra_level, label="extra_level").reshape(-1, 1)
+        infos = np.zeros((anchor.shape[0], 1), dtype=np.float32)
+        infos[0, 0] = self.voxel_size
+        infos[1, 0] = self.standard_dist
+
+        anchor_feats = _copy_strict(self._anchor_feat,
                                        transform=lambda t: t.detach().contiguous(),
                                        label="anchor_feat")
-        offsets = _copy_or_shadow(self._offset, '_offset_np',
-                                  (anchor.shape[0], 3 * self.n_offsets),
+        offsets = _copy_strict(self._offset,
                                   transform=lambda t: t.detach().reshape(anchor.shape[0], -1).contiguous(),
                                   label="offset")
-        opacities = _copy_or_shadow(self._opacity, '_opacity_np',
-                                    (anchor.shape[0], 1),
+        opacities = _copy_strict(self._opacity,
                                     transform=lambda t: t.detach().contiguous(),
                                     label="opacity")
-        scales = _copy_or_shadow(self._scaling, '_scaling_np',
-                                 (anchor.shape[0], 6),
+        scales = _copy_strict(self._scaling,
                                  transform=lambda t: t.detach().contiguous(),
                                  label="scaling")
-        rots = _copy_or_shadow(self._rotation, '_rotation_np',
-                               (anchor.shape[0], 4),
+        rots = _copy_strict(self._rotation,
                                transform=lambda t: t.detach().contiguous(),
                                label="rotation")
 
@@ -1335,18 +1374,12 @@ class GaussianModel:
             "scaling": "scaling (KNN distances)",
             "rotation": "rotation (quaternions)",
         }
-        status_icon = {
-            "T1": "[GPU real]",
-            "T2": "[GPU copy]",
-        }
         for lbl, name in label_map.items():
             tier_raw = _tier_log.get(lbl, "?")
             if tier_raw.startswith("T1"):
                 icon, desc = "[GPU real]", "T1(.numpy) - real trained values"
             elif tier_raw.startswith("T2"):
                 icon, desc = "[GPU copy]", "T2(memcpy)  - direct GPU copy"
-            elif "T3" in str(tier_raw):
-                icon, desc = "[SHADOW] ", f"T3(shadow)  - initial values (stale)"
             else:
                 icon, desc = "[?]      ", f"unknown: {tier_raw}"
             print(f"  {icon} {name:35s} {desc}")
@@ -1413,7 +1446,7 @@ class GaussianModel:
         self._offset = jt.array(offsets, dtype=jt.float).contiguous()  # [N*K, 3]
         self._anchor = jt.array(anchor, dtype=jt.float)
         self._scaling = jt.array(scales, dtype=jt.float)
-        self._opacity = jt.array(opacities, dtype=jt.float)
+        self._opacity = jt.array(opacities, dtype=jt.float).stop_grad()
         self._rotation = jt.array(rots, dtype=jt.float)
         self._anchor_mask = jt.ones(self._anchor.shape[0], dtype='bool')  # GPU bool tensor（Phase 78: 消除 CPU 规避）        # Numpy shadows for save_ply (already available from numpy load)
         self._anchor_np = anchor
@@ -1431,6 +1464,8 @@ class GaussianModel:
             if group["name"] == name:
                 with jt.enable_grad():
                     group["params"][0] = tensor.copy()
+                    if name == "opacity":
+                        group["params"][0].stop_grad()
                 # Lightweight optimizer (Namespace): skip Adam state
                 if "m" in group and len(group["m"]) > 0:
                     group["m"][0] = jt.zeros_like(tensor)
@@ -1442,7 +1477,9 @@ class GaussianModel:
 
 
     def cat_tensors_to_optimizer(self, tensors_dict):
+        """Append topology rows and their Adam state as one validated transaction."""
         optimizable_tensors = {}
+        pending = []
         for group in self.optimizer.param_groups:
             if  'mlp' in group['name'] or \
                 'conv' in group['name'] or \
@@ -1451,186 +1488,117 @@ class GaussianModel:
                 continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
-            # Lightweight optimizer (Namespace): skip Adam state m/v
-            if "m" in group and len(group["m"]) > 0:
-                group["m"][0] = jt.concat((group["m"][0], jt.zeros_like(extension_tensor)), dim=0)
-            if "values" in group and len(group["values"]) > 0:
-                group["values"][0] = jt.concat((group["values"][0], jt.zeros_like(extension_tensor)), dim=0)
-            old_tensor = group["params"].pop()
+            old_tensor = group["params"][0]
             with jt.enable_grad():
-                group["params"].append(jt.concat((old_tensor, extension_tensor), dim=0))
-                del old_tensor
-            optimizable_tensors[group["name"]] = group["params"][0]
+                # A topology transaction must leave the surviving parameter as
+                # a materialized graph leaf.  Without stop_fuse(), Jittor may
+                # compile the next backward together with the concat that made
+                # the parameter; a checkpoint restore starts from jt.array and
+                # therefore follows a different reduction graph despite equal
+                # values.  That broke next-step resume continuity after growth.
+                new_parameter = jt.concat(
+                    (old_tensor, extension_tensor), dim=0
+                ).detach().stop_fuse()
+                if group["name"] == "opacity":
+                    new_parameter.stop_grad()
+                else:
+                    new_parameter.requires_grad = not old_tensor.is_stop_grad()
+            new_state = {}
+            for state_name in ("m", "values", "grads"):
+                state_values = group.get(state_name, ())
+                if len(state_values) == 1:
+                    state = jt.concat(
+                        (state_values[0], jt.zeros_like(extension_tensor)), dim=0
+                    ).detach().stop_fuse()
+                    new_state[state_name] = [state]
+                elif len(state_values) != 0:
+                    raise ValueError(
+                        f"topology optimizer group {group['name']} has invalid {state_name} state")
+            expected = old_tensor.shape[0] + extension_tensor.shape[0]
+            if new_parameter.shape[0] != expected:
+                raise ValueError(f"topology append length mismatch for {group['name']}")
+            for state_name, values in new_state.items():
+                if values[0].shape != new_parameter.shape:
+                    raise ValueError(
+                        f"topology append {state_name} shape mismatch for {group['name']}")
+            pending.append((group, new_parameter, new_state))
 
-        jt.gc()
+        materialized = []
+        for group, new_parameter, new_state in pending:
+            group["params"] = [new_parameter]
+            for state_name, values in new_state.items():
+                group[state_name] = values
+                materialized.extend(values)
+            optimizable_tensors[group["name"]] = new_parameter
+            materialized.append(new_parameter)
+        if materialized:
+            jt.sync(materialized)
         return optimizable_tensors
 
 
-    def _sync_accumulators_to_jt(self):
-        """Sync accumulators (already Jittor tensors — no-op placeholder)."""
-        # All accumulators are now Jittor tensors managed via jt.scatter(add)
-        pass
-
-    def training_statis_np(self, viewspace_grad_np, opacity, update_filter, offset_selection_mask, anchor_visible_mask):
-        """Accumulate gradient/opacity stats for densification (pure Jittor GPU).
-
-        viewspace_grad_np: numpy [G,3] but may be None
-        opacity: jt.Var [M*K, 1] per-Gaussian opacity values
-        offset_selection_mask: numpy bool [M*K] — which offsets contributed
-        anchor_visible_mask: numpy int [M] — visible anchor indices
-        """
-        if viewspace_grad_np is None or len(viewspace_grad_np) == 0:
-            return
-        K = self.n_offsets
-        N = self._anchor.shape[0]
-
-        # Opacity accumulation via jt.scatter(add) (GPU atomicAdd)
-        try:
-            op_jt = opacity.clamp(min_v=0).reshape(-1, K).sum(dim=1, keepdims=True)  # [M, 1]
-            vis_idx = jt.array(anchor_visible_mask.reshape(-1, 1).astype(np.int32))
-            self.opacity_accum = jt.scatter(self.opacity_accum, 0, vis_idx, op_jt, reduce='add')
-        except:
-            pass
-
-        # Anchor demon via jt.scatter(add) (GPU)
-        try:
-            ones_jt = jt.ones((len(anchor_visible_mask), 1))
-            self.anchor_demon = jt.scatter(self.anchor_demon, 0, vis_idx, ones_jt, reduce='add')
-        except:
-            pass
-
-        # Offset gradient accumulation (GPU via jt.scatter + jt.norm)
-        req_size = N * K
-        # Ensure accumulators exist with correct size
-        if not hasattr(self, 'offset_gradient_accum') or self.offset_gradient_accum.shape[0] != req_size:
-            self.offset_gradient_accum = jt.zeros((req_size, 1))
-        if not hasattr(self, 'offset_denom') or self.offset_denom.shape[0] != req_size:
-            self.offset_denom = jt.zeros((req_size, 1))
-
-        sel_mask_np = np.asarray(offset_selection_mask, dtype=bool)
-        if len(sel_mask_np) != viewspace_grad_np.shape[0]:
-            min_len = min(len(sel_mask_np), viewspace_grad_np.shape[0])
-            sel_mask_np = sel_mask_np[:min_len]
-            viewspace_grad_np = viewspace_grad_np[:min_len]
-
-        if not sel_mask_np.any():
-            return
-
-        # Compute grad norm on GPU via Jittor
-        grad_jt = jt.array(viewspace_grad_np[sel_mask_np][:, :2].astype(np.float32))  # [S, 2]
-        grad_norm_jt = jt.norm(grad_jt, dim=1, keepdims=True)  # [S, 1]
-
-        # Build offset indices via Jittor (matches numpy-only original)
-        offset_base = anchor_visible_mask[..., None] * K + jt.arange(K)[None, :]  # [M, K]
-        sel_positions = offset_base.reshape(-1)[jt.array(sel_mask_np.astype(np.int32))]  # [S]
-        sel_idx = sel_positions.reshape(-1, 1).astype(jt.int32)  # [S, 1]
-
-        # GPU atomicAdd via jt.scatter
-        self.offset_gradient_accum = jt.scatter(self.offset_gradient_accum, 0, sel_idx, grad_norm_jt, reduce='add')
-        ones_jt2 = jt.ones_like(grad_norm_jt)
-        self.offset_denom = jt.scatter(self.offset_denom, 0, sel_idx, ones_jt2, reduce='add')
+    def training_statis_np(self, *args, **kwargs):
+        raise RuntimeError(
+            "training_statis_np is retired; production densification requires "
+            "the differentiable Jittor training_statis path")
 
     # statis grad information to guide liftting.
-    def training_statis(self, viewspace_grad, opacity, update_filter, offset_selection_mask, anchor_visible_mask):
-        """Accumulate gradient/opacity stats for densification.
-
-        Stats persist across chunks via checkpoint save/restore.
-        Numpy shadows initialized from restored jt tensors (not zeros).
-        """
+    def training_statis(
+        self, viewspace_grad, opacity, update_filter, offset_selection_mask,
+        anchor_visible_mask, *, check_finite=False,
+    ):
+        """Accumulate the original GANG densification statistics on the GPU."""
         if viewspace_grad is None:
             return
         K = self.n_offsets
         N = self._anchor.shape[0]
+        if anchor_visible_mask.shape[0] != N:
+            raise ValueError("anchor visibility mask length does not match anchor count")
 
-        # --- Expand anchor indices [M] → offset indices [M*K] ---
-        offset_base = np.repeat(anchor_visible_mask * K, K) + np.tile(np.arange(K), len(anchor_visible_mask))
-        sel_positions = offset_base[offset_selection_mask]
+        temp_opacity = opacity.detach().reshape(-1).clamp(min_v=0).reshape(-1, K)
+        self.opacity_accum[anchor_visible_mask] = (
+            self.opacity_accum[anchor_visible_mask]
+            + temp_opacity.sum(dim=1, keepdims=True)
+        )
+        self.anchor_demon[anchor_visible_mask] = self.anchor_demon[anchor_visible_mask] + 1
 
-        # --- Opacity accumulation (numpy, restored from checkpoint if available) ---
-        try:
-            op_np = opacity.numpy().reshape(-1, K)
-        except:
-            op_np = None
-        if op_np is not None:
-            op_np[op_np < 0] = 0
-            try:
-                self._opacity_accum_np = getattr(self, '_opacity_accum_np', None)
-                if self._opacity_accum_np is None or self._opacity_accum_np.shape[0] != N:
-                    try:
-                        self._opacity_accum_np = self.opacity_accum.numpy().copy()
-                    except:
-                        self._opacity_accum_np = np.zeros((N, 1), dtype=np.float32)
-                self._opacity_accum_np[anchor_visible_mask] += op_np.sum(axis=1, keepdims=True)
-                # Phase 28: defer jt.array() to _sync_accumulators_to_jt() — avoid per-iter SFRL alloc
-            except:
-                pass
+        expanded_visibility = anchor_visible_mask.unsqueeze(1).repeat([1, K]).reshape(-1)
+        combined_mask = jt.zeros((N * K,), dtype=jt.bool)
+        combined_mask[expanded_visibility] = offset_selection_mask
+        selected_offsets = combined_mask.clone()
+        combined_mask[selected_offsets] = update_filter
 
-        # --- Anchor demon (numpy, restored from checkpoint if available) ---
-        try:
-            self._anchor_demon_np = getattr(self, '_anchor_demon_np', None)
-            if self._anchor_demon_np is None or self._anchor_demon_np.shape[0] != N:
-                try:
-                    self._anchor_demon_np = self.anchor_demon.numpy().copy()
-                except:
-                    self._anchor_demon_np = np.zeros((N, 1), dtype=np.float32)
-            self._anchor_demon_np[anchor_visible_mask] += 1
-            # Phase 28: defer jt.array()
-        except:
-            pass
-
-        # --- Offset gradient accumulation (GPU via jt.scatter, Phase 54) ---
-        # Reference: JGaussian gaussian_model.py:792 — accum[mask] += grad (jt.Var persistent)
-        if len(sel_positions) == 0:
-            return
-        # Compute gradient norm on GPU (viewspace_grad is jt.Var)
-        try:
-            grad_norm_np = jt.norm(viewspace_grad[offset_selection_mask, :2], dim=-1).numpy().reshape(-1)
-        except:
-            grad_norm_np = np.zeros(len(sel_positions), dtype=np.float32)
-        sel_flat = sel_positions.ravel().astype(np.int32)
-        gn_flat = grad_norm_np.ravel()
-
-        # Phase 57: sel_flat and gn_flat may differ in length if offset_selection_mask
-        # and viewspace_grad have mismatched shapes. Truncate to min length.
-        if len(sel_flat) != len(gn_flat):
-            min_len = min(len(sel_flat), len(gn_flat))
-            sel_flat = sel_flat[:min_len]
-            gn_flat = gn_flat[:min_len]
-
-        # Phase 57: jt.scatter requires src.shape == x.shape (setitem_op.cc:82).
-        # Solution: pad src to full N*K rows using numpy (fast, ~1ms for 1.5M elements),
-        # then jt.array → GPU add. Pre-allocated GPU buffers avoid SFRL fragmentation.
-        req_size = N * K
-        # Allocate/reuse GPU temp buffers
-        if not hasattr(self, '_tmp_grad') or self._tmp_grad.shape[0] != req_size:
-            self._tmp_grad = jt.zeros((req_size, 1))
-        if not hasattr(self, '_tmp_ones') or self._tmp_ones.shape[0] != req_size:
-            self._tmp_ones = jt.zeros((req_size, 1))
-        if not hasattr(self, 'offset_gradient_accum') or self.offset_gradient_accum.shape[0] != req_size:
-            self.offset_gradient_accum = jt.zeros((req_size, 1))
-        if not hasattr(self, 'offset_denom') or self.offset_denom.shape[0] != req_size:
-            self.offset_denom = jt.zeros((req_size, 1))
-        # Build full-size arrays via CPU indexing + GPU copy
-        grad_np = np.zeros((req_size, 1), dtype=np.float32)
-        grad_np[sel_flat, 0] = gn_flat
-        ones_np = np.zeros((req_size, 1), dtype=np.float32)
-        ones_np[sel_flat, 0] = 1.0
-        self._tmp_grad.update(jt.array(grad_np))
-        self._tmp_ones.update(jt.array(ones_np))
-        self.offset_gradient_accum += self._tmp_grad
-        self.offset_denom += self._tmp_ones
+        grad_norm = jt.norm(viewspace_grad[update_filter, :2], dim=-1, keepdims=True)
+        if grad_norm.shape[0] != self.offset_gradient_accum[combined_mask].shape[0]:
+            raise ValueError("screen-space gradient count does not match densification mask")
+        self.offset_gradient_accum[combined_mask] = self.offset_gradient_accum[combined_mask] + grad_norm
+        self.offset_denom[combined_mask] = self.offset_denom[combined_mask] + 1
+        if check_finite:
+            failed = first_non_finite([
+                (name, getattr(self, name)) for name in (
+                    'opacity_accum', 'anchor_demon',
+                    'offset_gradient_accum', 'offset_denom',
+                )
+            ])
+            if failed is not None:
+                raise FloatingPointError(
+                    f"non-finite densification accumulator: {failed}")
         
     def _prune_anchor_optimizer(self, mask):
-        # Convert jt boolean mask to numpy int indices to avoid jt.where CUDA-only crash
+        # Keep pruning indices on device; optimizer parameters and all Adam
+        # buffers must undergo the same Jittor gather transaction.
         keep_idx = _jt_bool_to_np_indices(mask)
         K = self.n_offsets
         # For offset-level tensors, expand anchor indices to per-offset indices
         # offset has shape [N*K, ...], anchor has shape [N, ...]
-        if keep_idx is not None and len(keep_idx) > 0:
-            keep_idx_offset = np.repeat(keep_idx * K, K) + np.tile(np.arange(K), len(keep_idx))
+        if keep_idx is not None and int(keep_idx.shape[0]) > 0:
+            keep_idx_offset = (
+                keep_idx.reshape(-1, 1) * K
+                + jt.arange(K, dtype=jt.int32).reshape(1, -1)
+            ).reshape(-1).int32()
         else:
             keep_idx_offset = None
         optimizable_tensors = {}
+        pending = []
         for group in self.optimizer.param_groups:
             if  'mlp' in group['name'] or \
                 'conv' in group['name'] or \
@@ -1640,24 +1608,46 @@ class GaussianModel:
 
             idx = keep_idx_offset if group.get('name') == 'offset' else keep_idx
 
-            if idx is not None and len(idx) > 0:
-                old_tensor = group["params"][0]
-                new_tensor = old_tensor[idx]
-                group["params"] = [new_tensor]  # replace in-place for jt.optim.Adam
-                del old_tensor
+            old_tensor = group["params"][0]
+            selected = old_tensor[idx] if idx is not None and int(idx.shape[0]) > 0 else old_tensor[:0]
+            # Match the graph-leaf contract used by checkpoint restoration.
+            # This also prevents the next backward from fusing through the
+            # boolean gather that implements pruning.
+            new_tensor = selected.detach().stop_fuse()
+            if group["name"] == "opacity":
+                new_tensor.stop_grad()
             else:
-                old_tensor = group["params"][0]
-                new_tensor = old_tensor[:0]
-                group["params"] = [new_tensor]
-                del old_tensor
+                new_tensor.requires_grad = not old_tensor.is_stop_grad()
+            # Jittor Adam keeps first and second moments directly in each
+            # parameter group.  Apply the identical keep indices so surviving
+            # anchors retain their optimizer history.
+            new_state = {}
+            for state_name in ("m", "values", "grads"):
+                if state_name in group and len(group[state_name]) > 0:
+                    state = group[state_name][0]
+                    selected_state = state[idx] if idx is not None and int(idx.shape[0]) > 0 else state[:0]
+                    new_state[state_name] = [selected_state.detach().stop_fuse()]
+            for state_name, values in new_state.items():
+                if values[0].shape != new_tensor.shape:
+                    raise ValueError(
+                        f"topology prune {state_name} shape mismatch for {group['name']}")
+            pending.append((group, new_tensor, new_state))
+
+        materialized = []
+        for group, new_tensor, new_state in pending:
+            group["params"] = [new_tensor]
+            for state_name, values in new_state.items():
+                group[state_name] = values
+                materialized.extend(values)
             if group['name'] == "scaling":
                 scales = group["params"][0]
                 temp = scales[:, 3:]
                 temp[temp > 0.05] = 0.05
                 group["params"][0][:, 3:] = temp
             optimizable_tensors[group["name"]] = group["params"][0]
-
-        jt.gc()
+            materialized.append(group["params"][0])
+        if materialized:
+            jt.sync(materialized)
         return optimizable_tensors
 
     def _rebuild_jittor_from_numpy(self, op_dict):
@@ -1679,8 +1669,8 @@ class GaussianModel:
             try:
                 jt.sync_all()
                 return var.numpy()
-            except:
-                return fallback
+            except Exception as exc:
+                raise RuntimeError("failed to materialize topology state") from exc
 
         N = self._anchor.shape[0]; K = self.n_offsets
 
@@ -1707,8 +1697,10 @@ class GaussianModel:
             np_data = saved_np[attr]
             dtype = np.int32 if attr in ('_level', '_extra_level') else np.float32
             v = jt.array(np_data.astype(dtype))
-            if attr not in ('_level', '_extra_level'):
+            if attr not in ('_level', '_extra_level', '_opacity'):
                 v.requires_grad = True
+            elif attr == '_opacity':
+                v.stop_grad()
             setattr(self, attr, v)
         del saved_np
 
@@ -1778,9 +1770,10 @@ class GaussianModel:
             if level_mask.ndim > 1:
                 level_mask = level_mask.squeeze(dim=1)
             try:
-                _level_cnt = int(jt.sum(level_mask).numpy())
-            except:
-                _level_cnt = 1
+                _level_cnt = int(jt.sum(level_mask).item())
+            except Exception as exc:
+                raise RuntimeError(
+                    f"failed to materialize anchor count for level {cur_level}") from exc
             if _level_cnt == 0:
                 continue
             cur_size = self.voxel_size / (float(self.fork) ** cur_level)
@@ -1925,7 +1918,7 @@ class GaussianModel:
                 self._sync_np_shadows()
 
     def _sync_np_shadows(self):
-        """Try to sync numpy shadows from jt tensors (3 tiers: .numpy → memcpy → skip)."""
+        """Synchronize CPU mirrors, failing if current Jittor state cannot be read."""
         from utils.jt_safe import memcpy_to_numpy
 
         _sync_logged = set()
@@ -1944,11 +1937,10 @@ class GaussianModel:
                     if np_attr not in _sync_logged:
                         path_log(f"[FALLBACK] _sync_np_shadows: {np_attr} .numpy() failed, using memcpy_to_numpy")
                         _sync_logged.add(np_attr)
-                except:
-                    if np_attr not in _sync_logged:
-                        path_log(f"[FALLBACK] _sync_np_shadows: {np_attr} T1+T2 failed, keeping old shadow")
-                        _sync_logged.add(np_attr)
-                    return
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"_sync_np_shadows failed to materialize {attr_name}"
+                    ) from exc
             # Squeeze level/extra_level from [N,1] to [N]
             if np_attr in ('_level_np', '_extra_level_np') and val.ndim > 1:
                 val = val.squeeze(-1)
@@ -1964,6 +1956,11 @@ class GaussianModel:
         _sync_one('_rotation', '_rotation_np')
 
     def muti_plane_pruning(self, num=10,std = 2,planer_numer=16):
+        try:
+            import open3d as o3d
+        except ImportError as exc:
+            raise RuntimeError(
+                "muti_plane_pruning is an optional Open3D utility; install open3d explicitly") from exc
         # index = np.random.randint(0,3)
         index = 2 
         depth_min = self.get_anchor[:,index].min()
@@ -1979,9 +1976,9 @@ class GaussianModel:
             muti_mask = jt.zeros_like(depth_mask)
             muti_mask[depth_mask == (i + 1)] = 1
             try:
-                _muti_cnt = int(jt.sum(muti_mask).numpy())
-            except:
-                _muti_cnt = 0  # assume too few if can't read
+                _muti_cnt = int(jt.sum(muti_mask).item())
+            except Exception as exc:
+                raise RuntimeError("failed to read multi-plane point count") from exc
             if _muti_cnt < num * 10:
                 continue
             pcd_vector = o3d.geometry.PointCloud()
@@ -1993,19 +1990,38 @@ class GaussianModel:
             mask_point_temp[muti_mask==1] = True
         return mask_point_temp
     
-    def adjust_anchor(self, iteration, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, update_ratio=0.5, extra_ratio=4.0, extra_up=0.25, min_opacity=0.005):
-        # Phase 28: sync numpy accumulators to jt.Var (only once per densification interval)
-        self._sync_accumulators_to_jt()
+    def adjust_anchor(
+        self, iteration, check_interval=100, success_threshold=0.8,
+        grad_threshold=0.0002, update_ratio=0.5, extra_ratio=4.0,
+        extra_up=0.25, min_opacity=0.005,
+        gradient_division_policy="epsilon_1e-8",
+    ):
+        anchor_count_before = int(self.get_anchor.shape[0])
         # # adding anchors
         # Use .reshape(-1, 1) for safe shape handling (some tensors may have extra dims)
-        grads = self.offset_gradient_accum.reshape(-1, 1) / (self.offset_denom.reshape(-1, 1) + 1e-8)
-        # Safe NaN replacement (avoid boolean-indexed assignment crash)
-        nan_mask = grads.isnan()
-        grads = jt.where(nan_mask, jt.zeros_like(grads), grads)
+        failed = first_non_finite([
+            (name, getattr(self, name)) for name in (
+                'opacity_accum', 'anchor_demon',
+                'offset_gradient_accum', 'offset_denom',
+            )
+        ])
+        if failed is not None:
+            raise FloatingPointError(
+                "non-finite densification accumulator before topology update: "
+                f"{failed}")
+        # Source parity preserves the checked-out implementation's operation
+        # order: divide first, then replace only non-finite quotient rows.
+        grads = _normalized_densification_gradients(
+            self.offset_gradient_accum, self.offset_denom,
+            gradient_division_policy)
+        if first_non_finite([("normalized", grads)]) is not None:
+            raise FloatingPointError("non-finite normalized densification gradient")
         grads_norm = jt.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
 
         self.anchor_growing(iteration, grads_norm, grad_threshold, update_ratio, extra_ratio, extra_up, offset_mask)
+        anchor_count_after_growth = int(self.get_anchor.shape[0])
+        appended_anchor_count = anchor_count_after_growth - anchor_count_before
 
         # update offset_denom — direct Jittor boolean indexing (GPU)
         self.offset_denom[offset_mask] = 0  # boolean mask setitem → jt.ternary under contrib.py
@@ -2022,6 +2038,11 @@ class GaussianModel:
         prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
         anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1) # [N, 1]
         prune_mask = jt.logical_and(prune_mask, anchors_mask) # [N]
+        pruned_anchor_count = int(prune_mask.sum().item())
+        new_anchor_pruned_count = 0
+        if appended_anchor_count > 0:
+            new_anchor_pruned_count = int(
+                prune_mask[-appended_anchor_count:].sum().item())
         keep_mask = jt.logical_not(prune_mask)
 
         # Direct Jittor boolean indexing (GPU, no numpy round-trip)
@@ -2049,113 +2070,31 @@ class GaussianModel:
 
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)  # prune 为 True，保留为 False
+        return {
+            "anchor_count_before": anchor_count_before,
+            "anchor_count_after_growth": anchor_count_after_growth,
+            "anchor_count_after": int(self.get_anchor.shape[0]),
+            "appended_anchor_count": appended_anchor_count,
+            "pruned_anchor_count": pruned_anchor_count,
+            "new_anchor_pruned_count": new_anchor_pruned_count,
+        }
 
-    def save_mlp_checkpoints(self, path, mode = 'unite'):#split or unite
-        mkdir_p(os.path.dirname(path))
-        if mode == 'split':
-            self.eval()
-            opacity_mlp = jt.jit.trace(self.mlp_opacity, (jt.rand(1, self.feat_dim+self.view_dim+self.opacity_dist_dim+self.level_dim)))
-            opacity_mlp.save(os.path.join(path, 'opacity_mlp.pt'))
+    def save_mlp_checkpoints(self, path, mode='unite'):
+        """Reject the retired PLY-adjacent model serialization path.
 
-            cov_mlp = jt.jit.trace(self.mlp_cov, (jt.rand(1, self.feat_dim+self.view_dim+self.cov_dist_dim+self.level_dim)))
-            cov_mlp.save(os.path.join(path, 'cov_mlp.pt'))
-            color_mlp = jt.jit.trace(self.mlp_color, (jt.rand(1, self.feat_dim+self.view_dim+self.color_dist_dim+self.appearance_dim+self.level_dim)))
-            color_mlp.save(os.path.join(path, 'color_mlp.pt'))
+        Production training state is saved atomically by checkpoint v2.  A PLY
+        snapshot contains geometry for inspection only and cannot represent the
+        optimizer, RNG, topology, profile, or light state required to resume.
+        """
+        raise RuntimeError(
+            "legacy MLP checkpoint serialization is retired; save a strict v2 "
+            "training checkpoint instead")
 
-            if self.normal_detal:
-                normal1_mlp = jt.jit.trace(self.mlp_normal1, (jt.rand(1, self.feat_dim + self.view_dim + self.color_dist_dim + self.appearance_dim + self.level_dim)))
-                normal1_mlp.save(os.path.join(path, 'normal1_mlp.pt'))
-
-                normal2_mlp = jt.jit.trace(self.mlp_normal2, (jt.rand(1, self.feat_dim + self.view_dim + self.color_dist_dim + self.appearance_dim + self.level_dim)))
-                normal2_mlp.save(os.path.join(path, 'normal2_mlp.pt'))
-
-            if self.use_feat_bank:
-                feature_bank_mlp = jt.jit.trace(self.mlp_feature_bank, (jt.rand(1, 3+self.level_dim)))
-                feature_bank_mlp.save(os.path.join(path, 'feature_bank_mlp.pt'))
-            if self.appearance_dim > 0:
-                emd = jt.jit.trace(self.embedding_appearance, (jt.zeros((1,), dtype=jt.long)))
-                emd.save(os.path.join(path, 'embedding_appearance.pt'))
-            if self.is_pbr:
-                albedo_mlp = jt.jit.trace(self.mlp_albedo, (jt.rand(1, self.feat_dim + self.view_dim + self.color_dist_dim + self.appearance_dim + self.level_dim)))
-                albedo_mlp.save(os.path.join(path, 'albedo_mlp.pt'))
-                roughness_mlp = jt.jit.trace(self.mlp_roughness, (jt.rand(1, self.feat_dim+self.view_dim+self.opacity_dist_dim+self.level_dim)))
-                roughness_mlp.save(os.path.join(path, 'roughness_mlp.pt'))
-                mate_mlp = jt.jit.trace(self.mlp_matallic, (
-                    jt.rand(1, self.feat_dim + self.view_dim + self.opacity_dist_dim + self.level_dim)))
-                mate_mlp.save(os.path.join(path, 'matallic_mlp.pt'))
-
-            self.train()
-        elif mode == 'unite':
-            param_dict = {}
-            param_dict['opacity_mlp'] = self.mlp_opacity.state_dict()
-            param_dict['cov_mlp'] = self.mlp_cov.state_dict()
-            param_dict['color_mlp'] = self.mlp_color.state_dict()
-            # param_dict['sdf_mlp'] = self.SDF.state_dict()
-            
-            if self.normal_detal:
-                param_dict['normal1_mlp'] = self.mlp_normal1.state_dict()
-                param_dict['normal2_mlp'] = self.mlp_normal2.state_dict()
-
-            if self.use_feat_bank:
-                param_dict['feature_bank_mlp'] = self.mlp_feature_bank.state_dict()
-            if self.appearance_dim > 0:
-                param_dict['appearance'] = self.embedding_appearance.state_dict()
-
-            if self.is_pbr:
-                param_dict['albedo_mlp'] = self.mlp_albedo.state_dict()
-                param_dict['roughness_mlp'] = self.mlp_roughness.state_dict()
-                param_dict['matallic_mlp']= self.mlp_matallic.state_dict()
-
-
-            try:
-                jt.save(param_dict, os.path.join(path, 'checkpoints.pkl'))
-            except Exception as _e:
-                print(f"[WARN] jt.save failed ({_e}), skipping checkpoint save")
-        else:
-            raise NotImplementedError
-
-
-    def load_mlp_checkpoints(self, path, mode = 'unite'):#split or unite
-        if mode == 'split':
-            self.mlp_opacity = jt.jit.load(os.path.join(path, 'opacity_mlp.pt'))
-            self.mlp_cov = jt.jit.load(os.path.join(path, 'cov_mlp.pt'))
-            self.mlp_color = jt.jit.load(os.path.join(path, 'color_mlp.pt'))
-            # self.SDF = jt.jit.load(os.path.join(path, 'sdf_mlp.pt'))
-            
-            if self.normal_detal:
-                self.mlp_normal1 = jt.jit.load(os.path.join(path, 'normal1_mlp.pt'))
-                self.mlp_normal2 = jt.jit.load(os.path.join(path, 'normal2_mlp.pt'))
-
-            if self.use_feat_bank:
-                self.mlp_feature_bank = jt.jit.load(os.path.join(path, 'feature_bank_mlp.pt'))
-            if self.appearance_dim > 0:
-                self.embedding_appearance = jt.jit.load(os.path.join(path, 'embedding_appearance.pt'))
-            if self.is_pbr:
-                self.mlp_albedo = jt.jit.load(os.path.join(path, 'albedo_mlp.pt'))
-                self.mlp_roughness = jt.jit.load(os.path.join(path,'roughness_mlp.pt'))
-                self.mlp_matallic = jt.jit.load(os.path.join(path,"matallic_mlp.pt"))
-
-
-        elif mode == 'unite':
-            checkpoint = jt.load(os.path.join(path, 'checkpoints.pkl'))
-            self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
-            self.mlp_cov.load_state_dict(checkpoint['cov_mlp'])
-            self.mlp_color.load_state_dict(checkpoint['color_mlp'])
-            # self.SDF.load_state_dict(checkpoint['sdf_mlp'])
-            if self.normal_detal:
-                self.mlp_normal1.load_state_dict(checkpoint['normal1_mlp'])
-                self.mlp_normal2.load_state_dict(checkpoint['normal2_mlp'])
-            if self.use_feat_bank:
-                self.mlp_feature_bank.load_state_dict(checkpoint['feature_bank_mlp'])
-            if self.appearance_dim > 0:
-                self.embedding_appearance.load_state_dict(checkpoint['appearance'])
-            if self.is_pbr:
-                self.mlp_albedo.load_state_dict(checkpoint['albedo_mlp'])
-                self.mlp_roughness.load_state_dict(checkpoint['roughness_mlp'])
-                self.mlp_matallic.load_state_dict(checkpoint['matallic_mlp'])
-
-        else:
-            raise NotImplementedError
+    def load_mlp_checkpoints(self, path, mode='unite'):
+        """Reject legacy Pickle/JIT model loading in production code."""
+        raise RuntimeError(
+            "legacy MLP checkpoint loading is retired; load a strict v2 "
+            "training checkpoint instead")
 
 
     def computeNorm(self,scaling, rota,dir_pp_normalized, delta_normal1=None,delta_normal2=None):

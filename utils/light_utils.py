@@ -2,6 +2,7 @@
 _C = None  # compiled C++ extension (lite_rasterize_gaussians) — not in Jittor path
 GaussianRasterizationSettings = None
 GaussianRasterizer = None
+_RASTERIZER_IMPORT_ERRORS = ()
 
 import jittor as jt
 import jittor.nn as F
@@ -18,13 +19,28 @@ from copy import deepcopy
 try:
     from light_gaussian import _C as _C_ext, GaussianRasterizationSettings, GaussianRasterizer
     _C = _C_ext
-except (ImportError, ModuleNotFoundError, ValueError):
+except (ImportError, ModuleNotFoundError, ValueError, RuntimeError, OSError) as primary_import_error:
     # Jittor path: _C not available; GaussianRasterizationSettings/GaussianRasterizer
     # are inside light_gaussian.light_gaussian sub-package
     try:
         from light_gaussian.light_gaussian import GaussianRasterizationSettings, GaussianRasterizer
-    except (ImportError, ModuleNotFoundError, ValueError):
-        pass  # Will only fail if these are actually used
+    except (ImportError, ModuleNotFoundError, ValueError, RuntimeError, OSError) as fallback_import_error:
+        _RASTERIZER_IMPORT_ERRORS = (primary_import_error, fallback_import_error)
+
+
+def _require_point_shadow_rasterizer():
+    """Fail at the optional point-shadow boundary with the original cause."""
+    if GaussianRasterizer is not None and GaussianRasterizationSettings is not None:
+        return
+    details = "; ".join(
+        f"{type(error).__name__}: {error}" for error in _RASTERIZER_IMPORT_ERRORS
+    ) or "no rasterizer import exception was recorded"
+    error = RuntimeError(
+        "point-shadow rendering requires the Jittor light_gaussian rasterizer; "
+        f"dependency loading failed ({details})")
+    if _RASTERIZER_IMPORT_ERRORS:
+        raise error from _RASTERIZER_IMPORT_ERRORS[-1]
+    raise error
 
 def get_canonical_rays(H: int, W: int, tan_fovx: float, tan_fovy: float) -> jt.Var:
     cen_x = W / 2
@@ -188,8 +204,8 @@ def get_depth_cubemap(get_xyz,get_opacity,get_scaling,get_rotation,get_features,
     return jt.stack(depth_cubemap), jt.stack(opacity_cubemap)
 
 
-# Render a six-face depth-and-alpha cubemap from the point-light position using
-# the same
+# P1-b shadow cubemap (POINT_LIGHT_RENDER_QUALITY_FIX_PLAN.md §3.4): render a
+# 6-face depth(+alpha) cubemap from the point-light position using the SAME
 # Gaussian arrays as the main render (no MLP re-run). Face order and uv axes
 # match jittor_texture._texture_cube / scene.NVDIFFREC.util.cube_to_dir:
 #   0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z.
@@ -550,11 +566,11 @@ def receiver_identity_meta(receiver_xyz, light_position, shadow_res, bias=0.02, 
     }
 
 
-# `_strict_fill`, `calibrate_shadow_bounds`, `derive_nested` and
+# N3-A (§21): `_strict_fill`, `calibrate_shadow_bounds`, `derive_nested` and
 # `apply_query_distance` live in the pure-NumPy module `utils/shadow_bounds.py`
 # (no jittor import) so the bounds contract is testable on both Windows/Python
 # and WSL/Jittor. They are imported at the top of this module and re-exported
-# here as part of the public utility API.
+# here for backward compatibility with `_relight_views.py` / `_scan_light_los.py`.
 
 def _cube_w2c(light_position):
     """CPU analytic rigid-body inverse for the 6 cube faces (Stage A)."""
@@ -583,10 +599,9 @@ def render_transmit_cubemap(xyz, opacity, scaling, rot, light_position, res=512,
     final_cube [6,res,res]  <- a single 6-face map, same shape as
     transmit_cube[b] so dr.texture's cube sampler can index it as
     final_cube[None,...,None] == [1,6,res,res,1],
-    boundaries [num_boundaries]), or None if the rasterizer is unavailable.
+    boundaries [num_boundaries]).
     """
-    if GaussianRasterizer is None or GaussianRasterizationSettings is None:
-        return None
+    _require_point_shadow_rasterizer()
     if boundaries is None:
         xyz_np = np.asarray(xyz.numpy(), dtype=np.float32)
         lp = np.asarray(light_position, dtype=np.float32).reshape(1, 3)
@@ -645,8 +660,7 @@ def render_shadow_cubemap(xyz, opacity, scaling, rot, light_position, res=512,
         depth_cube [6,res,res] float32 ray distance (zfar where empty)
         alpha_cube [6,res,res] float32
     """
-    if GaussianRasterizer is None or GaussianRasterizationSettings is None:
-        return None, None
+    _require_point_shadow_rasterizer()
     # Canonical rays for a 90-degree FOV (focal = res/2, z=1), Jittor meshgrid
     # does not support indexing="xy", so build via linspace + broadcast.
     cen_x = res / 2
@@ -663,9 +677,10 @@ def render_shadow_cubemap(xyz, opacity, scaling, rot, light_position, res=512,
     # Must be non-empty, else the CUDA forward reads shs[0] and segfaults.
     dummy_col = jt.zeros([xyz.shape[0], 3])
 
-    # Build the six camera w2c matrices on CPU with an analytic rigid-body
-    # inverse. jt.linalg.inv uses jt.numpy_code and may require CuPy under CUDA.
-    # _CUBE_C2W rotations are signed permutation
+    # Stage A (POINT_LIGHT_BLOCKER_ROOT_CAUSE_AND_NEXT_STEPS.md): build the six
+    # camera w2c matrices on CPU with an analytic rigid-body inverse. jt.linalg.inv
+    # is implemented via jt.numpy_code, which imports cupy under use_cuda=1 —
+    # that was the cupy blocker. _CUBE_C2W rotations are signed permutation
     # matrices, so  w2c = [R_c2w.T | -R_c2w.T @ t; 0 1]  is exact in float32.
     light_pos_np = np.asarray(light_position, dtype=np.float32).reshape(-1)
     w2c_np_list = []

@@ -40,13 +40,14 @@ namespace BACKWARD
     const float* dL_dpixel_norms,
     const float* dL_dpixel_alphas,
     const float* dL_dpixel_extras,
-    float3* dL_dmean2D,
-    float4* dL_dconic2D,
-    float* dL_dopacity,
-    float* dL_dcolors,
-    float* dL_ddepths,
-    float* dL_dnorm3Ds,
-    float* dL_dextras);
+    double* dL_dmean2D,
+    double* dL_dconic2D,
+    double* dL_dopacity,
+    double* dL_dcolors,
+    double* dL_ddepths,
+    double* dL_dnorm3Ds,
+    double* dL_dextras,
+    double* mean_conic_partials);
 
   void preprocess(
     int P, int D, int M,

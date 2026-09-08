@@ -49,6 +49,119 @@ uint32_t getHigherMsb(uint32_t n)
   return msb;
 }
 
+__global__ void castDoubleToFloat(const int count, const double* input, float* output)
+{
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < count)
+    output[index] = static_cast<float>(input[index]);
+}
+
+static void allocateZeroedDouble(double** pointer, const size_t count)
+{
+  if (count == 0)
+  {
+    *pointer = nullptr;
+    return;
+  }
+  cudaError_t status = cudaMalloc(reinterpret_cast<void**>(pointer), count * sizeof(double));
+  if (status != cudaSuccess)
+    throw std::runtime_error(cudaGetErrorString(status));
+  status = cudaMemset(*pointer, 0, count * sizeof(double));
+  if (status != cudaSuccess)
+  {
+    cudaFree(*pointer);
+    *pointer = nullptr;
+    throw std::runtime_error(cudaGetErrorString(status));
+  }
+}
+
+static void castAccumulation(const int count, const double* input, float* output)
+{
+  if (count > 0)
+    castDoubleToFloat<<<(count + 255) / 256, 256>>>(count, input, output);
+}
+
+__global__ void buildMeanConicKeys(
+  const int count, const uint32_t* point_list, uint64_t* keys)
+{
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < count)
+    keys[index] = (static_cast<uint64_t>(point_list[index]) << 32)
+      | static_cast<uint32_t>(index);
+}
+
+__global__ void reduceMeanConicSegments(
+  const int count, const uint64_t* sorted_keys, const double* partials,
+  double* mean2D, double* conic)
+{
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count)
+    return;
+  const uint32_t gaussian = static_cast<uint32_t>(sorted_keys[index] >> 32);
+  if (index > 0 && static_cast<uint32_t>(sorted_keys[index - 1] >> 32) == gaussian)
+    return;
+
+  double sums[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+  for (int cursor = index; cursor < count; ++cursor)
+  {
+    const uint64_t key = sorted_keys[cursor];
+    if (static_cast<uint32_t>(key >> 32) != gaussian)
+      break;
+    const uint32_t occurrence = static_cast<uint32_t>(key);
+    const double* values = partials + static_cast<size_t>(occurrence) * 5;
+    #pragma unroll
+    for (int component = 0; component < 5; ++component)
+      sums[component] += values[component];
+  }
+  mean2D[gaussian * 3 + 0] = sums[0];
+  mean2D[gaussian * 3 + 1] = sums[1];
+  conic[gaussian * 4 + 0] = sums[2];
+  conic[gaussian * 4 + 1] = sums[3];
+  conic[gaussian * 4 + 3] = sums[4];
+}
+
+static void reduceMeanConicPartials(
+  const int count, const uint32_t* point_list, const double* partials,
+  double* mean2D, double* conic)
+{
+  if (count <= 0)
+    return;
+  uint64_t* keys_in = nullptr;
+  uint64_t* keys_out = nullptr;
+  void* sort_storage = nullptr;
+  size_t sort_size = 0;
+  cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&keys_in),
+                                  static_cast<size_t>(count) * sizeof(uint64_t));
+  if (status == cudaSuccess)
+    status = cudaMalloc(reinterpret_cast<void**>(&keys_out),
+                        static_cast<size_t>(count) * sizeof(uint64_t));
+  if (status != cudaSuccess)
+  {
+    cudaFree(keys_in);
+    cudaFree(keys_out);
+    throw std::runtime_error(cudaGetErrorString(status));
+  }
+  buildMeanConicKeys<<<(count + 255) / 256, 256>>>(count, point_list, keys_in);
+  status = cub::DeviceRadixSort::SortKeys(
+    nullptr, sort_size, keys_in, keys_out, count, 0, 64);
+  if (status == cudaSuccess)
+    status = cudaMalloc(&sort_storage, sort_size);
+  if (status == cudaSuccess)
+    status = cub::DeviceRadixSort::SortKeys(
+      sort_storage, sort_size, keys_in, keys_out, count, 0, 64);
+  if (status == cudaSuccess)
+  {
+    reduceMeanConicSegments<<<(count + 255) / 256, 256>>>(
+      count, keys_out, partials, mean2D, conic);
+    status = cudaGetLastError();
+  }
+  cudaFree(sort_storage);
+  cudaFree(keys_in);
+  cudaFree(keys_out);
+  if (status != cudaSuccess)
+    throw std::runtime_error(cudaGetErrorString(status));
+}
+
 // Wrapper method to call auxiliary coarse frustum containment test.
 // Mark all Gaussians that pass it.
 __global__ void checkFrustum(int P,
@@ -306,7 +419,7 @@ int CudaRasterizer::Rasterizer::forward(
     binningState.point_list_keys_unsorted,
     binningState.point_list_unsorted,
     radii,
-    tile_grid)
+    tile_grid);
   CHECK_CUDA(, debug)
 
   int bit = getHigherMsb(tile_grid.x * tile_grid.y);
@@ -476,7 +589,7 @@ void CudaRasterizer::Rasterizer::forward_1(
 		binningState.point_list_keys_unsorted,
 		binningState.point_list_unsorted,
 		radii,
-		tile_grid)
+		tile_grid);
 	CHECK_CUDA(, debug)
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
@@ -584,6 +697,27 @@ void CudaRasterizer::Rasterizer::backward(
   // If we were given precomputed colors and not SHs, use them.
   const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
   const float* norm_ptr = (norm3Ds_precomp != nullptr) ? norm3Ds_precomp : geomState.norm3D;
+  // Pixel threads reach each Gaussian in a scheduler-dependent order.  Keep
+  // only these cross-pixel accumulators in double precision, then cast once to
+  // the public FP32 gradient buffers.  Every contribution remains FP32 and all
+  // downstream preprocessing remains FP32; the wider accumulator prevents
+  // atomic arrival order from changing the rounded FP32 result.
+  double* accum_mean2D = nullptr;
+  double* accum_conic = nullptr;
+  double* accum_opacity = nullptr;
+  double* accum_color = nullptr;
+  double* accum_depth = nullptr;
+  double* accum_norm3D = nullptr;
+  double* accum_extra = nullptr;
+  double* mean_conic_partials = nullptr;
+  allocateZeroedDouble(&accum_mean2D, static_cast<size_t>(P) * 3);
+  allocateZeroedDouble(&accum_conic, static_cast<size_t>(P) * 4);
+  allocateZeroedDouble(&accum_opacity, static_cast<size_t>(P));
+  allocateZeroedDouble(&accum_color, static_cast<size_t>(P) * NUM_CHANNELS);
+  allocateZeroedDouble(&accum_depth, static_cast<size_t>(P));
+  allocateZeroedDouble(&accum_norm3D, static_cast<size_t>(P) * 3);
+  allocateZeroedDouble(&accum_extra, static_cast<size_t>(P) * ED);
+  allocateZeroedDouble(&mean_conic_partials, static_cast<size_t>(R) * 5);
   CHECK_CUDA(BACKWARD::render(
     tile_grid,
     block,
@@ -604,13 +738,26 @@ void CudaRasterizer::Rasterizer::backward(
     dL_dpix_norm,
     dL_dpix_alpha,
     dL_dpix_extra,
-    (float3*)dL_dmean2D,
-    (float4*)dL_dconic,
-    dL_dopacity,
-    dL_dcolor,
-    dL_ddepth,
-    dL_dnorm3D,
-    dL_dextra), debug)
+    accum_mean2D,
+    accum_conic,
+    accum_opacity,
+    accum_color,
+    accum_depth,
+    accum_norm3D,
+    accum_extra,
+    mean_conic_partials), debug)
+
+  reduceMeanConicPartials(
+    R, binningState.point_list, mean_conic_partials,
+    accum_mean2D, accum_conic);
+
+  castAccumulation(P * 3, accum_mean2D, dL_dmean2D);
+  castAccumulation(P * 4, accum_conic, dL_dconic);
+  castAccumulation(P, accum_opacity, dL_dopacity);
+  castAccumulation(P * NUM_CHANNELS, accum_color, dL_dcolor);
+  castAccumulation(P, accum_depth, dL_ddepth);
+  castAccumulation(P * 3, accum_norm3D, dL_dnorm3D);
+  castAccumulation(P * ED, accum_extra, dL_dextra);
 
   // Take care of the rest of preprocessing. Was the precomputed covariance
   // given to us or a scales/rot pair? If precomputed, pass that. If not,
@@ -642,6 +789,16 @@ void CudaRasterizer::Rasterizer::backward(
     dL_dsh,
     (glm::vec3*)dL_dscale,
     (glm::vec4*)dL_drot), debug)
+
+  cudaFree(accum_mean2D);
+  cudaFree(accum_conic);
+  cudaFree(accum_opacity);
+  cudaFree(accum_color);
+  cudaFree(accum_depth);
+  cudaFree(accum_norm3D);
+  if (accum_extra != nullptr)
+  cudaFree(accum_extra);
+  cudaFree(mean_conic_partials);
 }
 
 
@@ -1016,4 +1173,3 @@ void CudaRasterizer::Rasterizer::depthToNormal(
 		normalMap
 	);
 }
-

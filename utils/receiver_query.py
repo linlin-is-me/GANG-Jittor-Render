@@ -1,4 +1,4 @@
-"""Pure-NumPy receiver-to-query-list layout contract.
+"""§28.4 E0: pure-NumPy receiver -> query-list layout contract.
 
 Deterministically maps each receiver to the cubemap (face, pixel, q) used by the
 production nearest-transmittance query. Face/UV/pixel semantics mirror
@@ -8,12 +8,13 @@ production nearest-transmittance query. Face/UV/pixel semantics mirror
     `_sample_single`/`util._cubemap_sample_jt`;
   * per-face UV projection (L116-127) with the +1e-10 denominator;
   * uv_01 = u*0.5+0.5, then pixel = floor(uv_01*res) clamped to [0, res-1]
-    (align_corners=False nearest; the half-texel rule follows grid_sample).
+    (align_corners=False nearest; the half-texel rule is validated against
+    grid_sample in `_test_receiver_exact.py` — §28.2.3 says measure, don't infer).
 
 This module computes NO transmittance — it only produces the deterministic
 sorted query layout the CUDA kernel (E1) consumes. Pure NumPy, no Jittor import.
 
-Layout outputs:
+Layout outputs (§28.4):
   q_original[G]           float32  max(||p-L||-bias, znear)
   face_original[G]        uint8    mutually-exclusive face index 0..5
   pixel_original[G]       int32    nearest pixel 0..res*res-1
@@ -75,8 +76,9 @@ def _face_uv(d, faces):
 def _nearest_pixel(uv_01, res):
     """align_corners=False nearest: floor(uv_01*res) clamped to [0, res-1].
 
-    The half-texel tie rule follows jittor_texture.grid_sample. Keep this helper
-    synchronized with the production texture sampler.
+    The half-texel tie rule is MEASURED against jittor_texture.grid_sample in
+    `_test_receiver_exact.py::test_texture_pixel_parity` (§28.2.3); if that parity
+    fails, this is the function to adjust (and the test then documents the rule).
     """
     p = np.floor(uv_01 * res)
     return np.clip(p, 0, res - 1).astype(np.int64)

@@ -9,12 +9,19 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 from __future__ import annotations
+from pathlib import Path
+import sys
+
+_SUBMODULES = Path(__file__).resolve().parents[1] / "submodules"
+if str(_SUBMODULES) not in sys.path:
+    sys.path.insert(0, str(_SUBMODULES))
+
 import jittor as jt
 
 import math
 # from depth_normal_gauss import GaussianRasterizationSettings,GaussianRasterizer
 # from light_geo_gauss import GaussianRasterizationSettings,GaussianRasterizer,SurfaceAlign
-from light_gaussian import GaussianRasterizationSettings,GaussianRasterizer
+from light_gaussian import GaussianRasterizationSettings,GaussianRasterizer,SurfaceAlign
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from scene.gaussian_model import GaussianModel  # type hint only, avoids circular import
@@ -25,8 +32,30 @@ from utils.graphics_utils import rgb_to_srgb
 # from Baking import recon_occlusion
 # import open3d as o3d
 from utils.graphics_utils import normal_from_depth_image
-from utils.loss_utils import eikonal_loss
+from utils.loss_utils import _stable_full_mean, eikonal_loss
 from utils.jt_safe import path_log
+
+
+def release_training_rasterizer_refs():
+    """Release diagnostic rasterizer owners after a completed training step.
+
+    The custom backward has already consumed and synchronized its saved CUDA
+    buffers when the trainers call this helper.  Keeping these module globals
+    alive until the next forward makes a continuous run retain one more native
+    rasterizer context than a fresh-process resume.
+    """
+    global _last_rasterize_func, _last_rasterizer
+    _last_rasterize_func = None
+    _last_rasterizer = None
+
+
+def training_rasterizer_stats():
+    """Return shape-only runtime statistics without copying device arrays."""
+    function = globals().get("_last_rasterize_func")
+    if function is None:
+        return None
+    stats = getattr(function, "runtime_stats", None)
+    return dict(stats) if stats is not None else None
 
 def debug_hook(module, input, output):
     if jt.isnan(output).any():
@@ -43,29 +72,32 @@ def build_rotation(r):
 
     q = r / norm[:, None]
 
-    R = jt.zeros((q.size(0), 3, 3))
-
     r = q[:, 0]
     x = q[:, 1]
     y = q[:, 2]
     z = q[:, 3]
 
-    R[:, 0, 0] = 1 - 2 * (y * y + z * z)
-    R[:, 0, 1] = 2 * (x * y - r * z)
-    R[:, 0, 2] = 2 * (x * z + r * y)
-    R[:, 1, 0] = 2 * (x * y + r * z)
-    R[:, 1, 1] = 1 - 2 * (x * x + z * z)
-    R[:, 1, 2] = 2 * (y * z - r * x)
-    R[:, 2, 0] = 2 * (x * z - r * y)
-    R[:, 2, 1] = 2 * (y * z + r * x)
-    R[:, 2, 2] = 1 - 2 * (x * x + y * y)
-    return R
+
+    row0 = jt.stack((1 - 2 * (y * y + z * z),
+                     2 * (x * y - r * z),
+                     2 * (x * z + r * y)), dim=1)
+    row1 = jt.stack((2 * (x * y + r * z),
+                     1 - 2 * (x * x + z * z),
+                     2 * (y * z - r * x)), dim=1)
+    row2 = jt.stack((2 * (x * z - r * y),
+                     2 * (y * z + r * x),
+                     1 - 2 * (x * x + y * y)), dim=1)
+    return jt.stack((row0, row1, row2), dim=1)
 
 def local_var(inputs):
-    # input N M C
-    aa = jt.var(inputs,dim=1)
-
-    return jt.mean(jt.sum(aa,dim=-1))
+    # input N M C.  Keep the population-variance contract of jt.var's
+    # unbiased=False default, but perform both reductions in FP64.  The FP32
+    # nested reductions were the sole differing forward value in the
+    # controlled phase-two resume trace (2.62e-10 absolute at a 2.60e-4 loss).
+    values = inputs.float64()
+    centered = values - values.mean(dim=1, keepdims=True)
+    per_channel = (centered * centered).mean(dim=1)
+    return _stable_full_mean(per_channel.sum(dim=-1)).float32()
 
 def local_var_normal(inputs,mask):
     # input N M C
@@ -107,9 +139,15 @@ def _bool_to_indices(mask):
         if idx.ndim > 1:
             idx = idx.squeeze(1)
         return idx  # jt.Var — preserves autograd for downstream
-    except:
-        # Last resort: all indices (no GPU→CPU round-trip)
-        return np.arange(mask.shape[0], dtype=np.int32)
+    except Exception as exc:
+        # Visibility is part of the renderer's numerical contract.  Treating a
+        # failed nonzero operation as an all-visible mask silently changes both
+        # the rendered image and the gradients, so the production path must
+        # fail closed instead of substituting indices.
+        raise RuntimeError(
+            f"failed to materialize Jittor visibility indices for mask "
+            f"shape={tuple(mask.shape)} dtype={mask.dtype}"
+        ) from exc
 
 
 _safe_index_logged = {"numpy": False, "jtcode": False, "arange": False, "jtidx": False}
@@ -211,8 +249,111 @@ def _safe_index(tensor, idx):
                           f"shape={tensor.shape}: {_msg2}")
 
 
+_AXIS0_GATHER_HEADER = r'''
+template <typename T>
+__global__ void axis0_gather_forward_kernel(
+        const T* source, const int* indices, T* output,
+        int rows, int width) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * width;
+    if (tid >= total) return;
+    int row = tid / width;
+    int column = tid - row * width;
+    output[tid] = source[indices[row] * width + column];
+}
 
-def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False, iteration= 0, ape_code=-1, is_pbr=False, normal_smooth_weight=0.0):
+__global__ void axis0_gather_backward_kernel(
+        const float* grad_output, const int* indices, float* grad_source,
+        int rows, int width) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * width;
+    if (tid >= total) return;
+    int row = tid / width;
+    int column = tid - row * width;
+    atomicAdd(grad_source + indices[row] * width + column, grad_output[tid]);
+}
+'''
+
+
+class _Axis0GatherFunction(jt.Function):
+    def execute(self, source, indices):
+        if str(source.dtype) not in {"float32", "int32", "int64", "bool"}:
+            raise TypeError(f"axis-0 gather does not support dtype {source.dtype}")
+        self.source_shape = list(source.shape)
+        self.rows = int(indices.shape[0])
+        self.width = int(np.prod(source.shape[1:])) if source.ndim > 1 else 1
+        self.indices = indices.stop_grad()
+        output = jt.code(
+            [self.rows, self.width], source.dtype, [source, self.indices],
+            cuda_header=_AXIS0_GATHER_HEADER,
+            cuda_src=r'''
+@alias(source, in0)
+@alias(indices, in1)
+int rows = in1->num;
+int width = in0->num / in0_shape0;
+int total = rows * width;
+int block = 256;
+int grid = (total + block - 1) / block;
+axis0_gather_forward_kernel<<<grid, block>>>(
+    source_p, indices_p, out0_p, rows, width);
+''',
+        )
+        return output.reshape([self.rows] + self.source_shape[1:])
+
+    def grad(self, grad_output):
+        if grad_output.dtype != jt.float32:
+            return None, None
+        grad_source = jt.code(
+            self.source_shape, grad_output.dtype, [grad_output, self.indices],
+            cuda_header=_AXIS0_GATHER_HEADER,
+            cuda_src=r'''
+@alias(grad_output, in0)
+@alias(indices, in1)
+cudaMemset(out0_p, 0, out0->size);
+int rows = in1->num;
+int width = in0->num / rows;
+int total = rows * width;
+int block = 256;
+int grid = (total + block - 1) / block;
+axis0_gather_backward_kernel<<<grid, block>>>(
+    grad_output_p, indices_p, out0_p, rows, width);
+''',
+        )
+        return grad_source, None
+
+
+def _axis0_gather(tensor, idx):
+    """Gather axis-0 rows without collapsing trailing dimensions.
+
+    Jittor 1.3.11 ``tensor[idx]`` does not match the required PyTorch contract
+    when ``tensor`` is three-dimensional and ``idx`` is a one-dimensional Var.
+    Expanding the index to the output shape makes the axis explicit.  The
+    underlying ``jt.gather`` implementation uses getitem and has a verified
+    scatter-add backward.
+    """
+    n = int(idx.shape[0]) if isinstance(idx, jt.Var) else len(idx)
+    if n == 0:
+        return tensor[:0]
+    if (isinstance(idx, np.ndarray) and n == tensor.shape[0]
+            and idx[0] == 0 and idx[-1] == n - 1):
+        return tensor
+    idx_var = idx if isinstance(idx, jt.Var) else jt.array(np.asarray(idx, dtype=np.int32))
+    if idx_var.dtype != jt.int32:
+        idx_var = idx_var.int32()
+    expected_shape = [n] + list(tensor.shape[1:])
+    result = _Axis0GatherFunction()(tensor, idx_var)
+    if list(result.shape) != expected_shape:
+        raise RuntimeError(
+            f"axis-0 gather shape mismatch: {list(result.shape)} != {expected_shape}")
+    return result
+
+
+# All production call sites below resolve this audited axis-0 implementation.
+_safe_index = _axis0_gather
+
+
+
+def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False, iteration= 0, ape_code=-1, is_pbr=False, normal_smooth_weight=0.0, trace_intermediates=False):
     ## view frustum filtering for acceleration
     global roughness, albedo, matallic
     indices = _bool_to_indices(visible_mask)
@@ -236,14 +377,12 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             offset_indices = offset_indices.reshape(-1)
     else:
         offset_indices = None
-    # FIX (M2/root-cause): pc._offset is [N, K, 3]; index dim 0 with the ANCHOR
-    # indices (∈ [0, N)) exactly like PT GANG's `pc._offset[visible_mask]`.
-    # The previous offset_indices (= indices*K + j, up to N*K) over-indexed the
-    # [N,K,3] tensor by K× → ~2.25M OOB reads per view (garbage offsets; crashed
-    # at res=1). view(-1,3) below flattens [M,K,3] → [M*K, 3].
+    # Jittor stores offsets flattened as [N*K, 3].  Expand visible anchor
+    # indices before gathering to reproduce PT's pc._offset[visible_mask].
     grid_offsets = pc._offset
     if indices is not None:
-        grid_offsets = _safe_index(grid_offsets, indices)
+        grid_offsets = _safe_index(grid_offsets, offset_indices)
+    grid_offsets = grid_offsets.reshape([anchor.shape[0], pc.n_offsets, 3])
     # _scaling is anchor-level [N, 6]
     grid_scaling = _idx(pc.get_scaling)
 
@@ -254,8 +393,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     ob_view = anchor - viewpoint_camera.camera_center
     # dist
     ob_dist_raw = ob_view.norm(dim=1, keepdim=True)
-    # Normalize distance to ~1.0 to prevent MLP saturation on large-scale scenes
-    ob_dist = ob_dist_raw / (ob_dist_raw.mean().detach() + 1e-8)
+    ob_dist = ob_dist_raw
     # view direction (unit vector)
     ob_view = ob_view / ob_dist_raw
 
@@ -371,69 +509,23 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         flag=0
 
     if is_training and flag ==1:
-
-        # Phase 54d: Pure Jittor SurfaceAlign — no jt.code/jt.Function, autograd-native.
-        # Replaces SurfaceAlignCUDA kernel. jt.grad() CAN trace through pure Jittor ops.
-        # _expand_np = np.arange(N, dtype=int32).repeat(K) — already computed at line 401.
+        # GANG uses a custom CUDA backward here.  It treats mean_d as saved
+        # state and therefore is not the ordinary derivative of the forward
+        # expression; use the ported jt.Function boundary rather than native
+        # autodiff reductions.
         K = pc.n_offsets
-        scaling_3_repeat = grid_scaling[_expand_np, :3]   # [N*K, 3] numpy-indexed gather
-        rot_input = scale_rot[:, 3:7]                      # [N*K, 4] pure Jittor slice
+        scaling_3_repeat = grid_scaling[_expand_np, :3]
+        rot_input = scale_rot[:, 3:7]
         offsets_all = offsets * scaling_3_repeat
         rot_all = pc.rotation_activation(rot_input)
-
-        # Compute xyz from anchor expansion
-        repeat_anchor_all = anchor[_expand_np]              # [N*K, 3]
-        xyz_all = repeat_anchor_all + offsets_all            # [N*K, 3]
-
-        # ---- Pure Jittor SurfaceAlign (replaces SurfaceAlignCUDA) ----
-        # Math identical to processKNNCUDA in rasterize_points_jt.py:62-115
-        r, x, y, z = rot_all[:,0], rot_all[:,1], rot_all[:,2], rot_all[:,3]
-        normals = jt.stack([
-            2*(x*z + r*y),
-            2*(y*z - r*x),
-            1 - 2*(x*x + y*y)
-        ], dim=-1)  # [N*K, 3]
-
-        xyzs_NK = xyz_all.reshape(-1, K, 3)
-        norms_NK = normals.reshape(-1, K, 3)
-
-        # Center = first Gaussian per anchor  [N, 3]
-        center_xyz = xyzs_NK[:, 0, :]
-        center_norm = norms_NK[:, 0, :]
-
-        # cos between center normal and all K neighbor normals  [N, K]
-        cos_theta = (center_norm.unsqueeze(1) * norms_NK).sum(dim=-1)
-
-        # Mask: cos in (0.96593, 1.0) — within ~15 degrees
-        mask = (cos_theta < 1.0) & (cos_theta > 0.96593)
-        mask_f = mask.float32()
-
-        # Signed distance: dot(xyz_i, center_normal)  [N, K]
-        dists = (xyzs_NK * center_norm.unsqueeze(1)).sum(dim=-1)
-
-        # Mean signed distance per center, masked
-        count = mask_f.sum(dim=-1).clamp(min_v=1.0)  # [N]
-        mean_d = (dists * mask_f).sum(dim=-1) / count  # [N]
-
-        # Per-center normal loss  [N]
-        pair_normal_center = ((1.0 - cos_theta) * mask_f).sum(dim=-1)
-
-        # Per-center distance variance loss  [N]
-        pair_d_center = (((dists - mean_d.unsqueeze(1)) ** 2) * mask_f).sum(dim=-1)
-
-        # Scatter to [N*K] (loss at center position 0, K, 2K, ...)
-        # Use jt.scatter: 2D output, 1D index, 2D src
-        N_anchor = xyzs_NK.shape[0]
-        center_idx = jt.arange(N_anchor) * K  # [N] GPU
-        out_NK_2d = jt.zeros((N_anchor * K, 1))
-        pair_d_nk = jt.scatter(out_NK_2d, 0, center_idx,
-                               pair_d_center.reshape(-1, 1), reduce='add')
-        pair_n_nk = jt.scatter(out_NK_2d, 0, center_idx,
-                               pair_normal_center.reshape(-1, 1), reduce='add')
-
-        pair_d_loss = pair_d_nk.reshape(-1)
-        pair_normal_loss = pair_n_nk.reshape(-1)
-        local_loss += 0.05*jt.mean(pair_d_loss) + 0.01*jt.mean(pair_normal_loss)
+        knn_index = jt.array(
+            np.arange(N_anchor * K, dtype=np.int32).reshape(N_anchor, K))
+        pair_d_loss, pair_normal_loss = SurfaceAlign()(
+            anchor, offsets_all, rot_all, knn_index)
+        local_loss += (
+            0.05 * _stable_full_mean(pair_d_loss)
+            + 0.01 * _stable_full_mean(pair_normal_loss)
+        )
 
 
     # Filter each component individually via _safe_index (no concat, no split, no numpy).
@@ -449,43 +541,44 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     
 
     # post-process cov (using filtered versions passed to rasterizer)
+    # Match GANG-master/gaussian_renderer/__init__.py:210 exactly.  A former
+    # migration-only [1e-8, 1.0] clamp changed valid scales and their normals;
+    # it was not a classified profile difference.
     scaling = scaling_repeat[:,3:] * jt.sigmoid(scale_rot_filtered[:,:3])
-    scaling = scaling.maximum(1e-8).minimum(1.0)  # runtime clamp: prevent giant Gaussians (Phase 44)
 
     rot = pc.rotation_activation(rotation_repeat*scale_rot_filtered[:,3:7])
 
     # post-process offsets to get centers for gaussians
     offsets_out = offsets_filtered * scaling_repeat[:,:3]
     xyz = repeat_anchor + offsets_out
-
-    # === Manual grad diagnostic capture (Phase 22) ===
-    # Store intermediate tensors for manual gradient computation.
-    # These are read via cupy in utils/manual_grad.py:compute_geometry_grads().
-    # M2 (P0): gate behind is_training — in inference this dict held ~200-300MiB of
-    # [G,*] tensors on the model object across views (a training scratch-buffer leak
-    # that caused single-process multi-view memory accumulation + SFRL illegal address).
-    if is_training:
-        pc._diag_data = {
-            'scaling_repeat': scaling_repeat,        # [G, 6]
-            'rotation_repeat': rotation_repeat,      # [G, 4]
-            'scale_rot_filtered': scale_rot_filtered,  # [G, 7]
-            'offsets_filtered': offsets_filtered,    # [G, 3]
-            'grid_scaling': grid_scaling,            # [M, 6]
-            'grid_rotation': grid_rotation,          # [M, 4]
-            'anchor_M': anchor,                      # [M, 3] (before expand)
-            'mask_indices': mask_indices,            # [G] numpy int64
-            'visible_indices': indices,              # [M] numpy int64 (may be None)
-            'expand_np': _expand_np,                 # [M*K] numpy int32
-            'offsets_MK': offsets,                   # [M*K, 3]
-            'scale_rot_MK': scale_rot,               # [M*K, 7] (MLP output, pre-filter)
-            'offset_indices': offset_indices if 'offset_indices' in dir() else None,  # [M*K] numpy
-            # Phase 30: MLP backward inputs
-            'mlp_opacity_input': _opacity_input if '_opacity_input' in dir() else None,
-            'mlp_cov_input': _cov_input if '_cov_input' in dir() else None,
-            'mlp_color_input': _color_input if '_color_input' in dir() else None,
-            # Phase 39: PBR MLP backward inputs
-            'is_pbr': is_pbr,
-            'mlp_pbr_input': _opacity_input if '_opacity_input' in dir() else None,
+    decoder_trace = None
+    if trace_intermediates:
+        decoder_trace = {
+            "visible_indices": indices,
+            "anchor": anchor,
+            "anchor_feat": feat,
+            "grid_offsets": grid_offsets,
+            "grid_scaling": grid_scaling,
+            "grid_rotation": grid_rotation,
+            "ob_view": ob_view,
+            "ob_dist": ob_dist,
+            "mlp_input": cat_local_view_wodist,
+            "neural_opacity": neural_opacity,
+            "mask_indices": mask_indices,
+            "scaling_expanded": scaling_expanded,
+            "rotation_expanded": rotation_expanded,
+            "repeat_anchor_filtered": repeat_anchor,
+            "scale_rot_full": scale_rot,
+            "offsets_full": offsets,
+            "scaling_repeat": scaling_repeat,
+            "rotation_repeat": rotation_repeat,
+            "color_filtered": color_filtered,
+            "scale_rot_filtered": scale_rot_filtered,
+            "offsets_filtered": offsets_filtered,
+            "offsets_out": offsets_out,
+            "xyz": xyz,
+            "activated_scaling": scaling,
+            "activated_rotation": rot,
         }
 
     view_dir = xyz - viewpoint_camera.camera_center.repeat(xyz.shape[0], 1)
@@ -529,8 +622,6 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # before PBR MLPs (roughness+albedo+metallic) start building their lazy graph.
     # This mirrors PyTorch eager execution — each MLP group executes and frees
     # intermediates independently, reducing peak lazy-graph memory by ~40%.
-    jt.sync_all(); jt.gc(); jt.gc()
-
     if is_pbr:
         matallic = None
         if pc.add_opacity_dist:
@@ -567,7 +658,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
         albedo =  jt.clamp(albedo, 0.0, 1.0)
         roughness =  jt.clamp(roughness, 0.001, 1.0)
-        matallic =  jt.clamp(matallic, 0.0, 1.0)
+        if pc.with_matallic:
+            matallic = jt.clamp(matallic, 0.0, 1.0)
 
     else:
         albedo = None
@@ -580,7 +672,12 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     color = color_filtered
     scale_rot = scale_rot_filtered
 
-    return xyz, color, opacity, scaling, rot, neural_opacity, mask, albedo, roughness, matallic,normal,delta_normal_norm,local_loss,sdf_loss
+    result = (xyz, color, opacity, scaling, rot, neural_opacity, mask, albedo,
+              roughness, matallic, normal, delta_normal_norm, local_loss, sdf_loss)
+    if trace_intermediates:
+        decoder_trace["normal"] = normal
+        return result + (decoder_trace,)
+    return result
 
 
 
@@ -631,7 +728,7 @@ def generate_shadow_gaussians(pc, light_position, anchor_indices=None,
         vc = jt.array(np.asarray(viewdir_center, dtype=np.float32).reshape(-1))
     ob_view = anchor - vc.unsqueeze(0)                       # [N,3]
     ob_dist_raw = ob_view.norm(dim=1, keepdim=True)
-    ob_dist = ob_dist_raw / (ob_dist_raw.mean().detach() + 1e-8)
+    ob_dist = ob_dist_raw
     ob_view = ob_view / ob_dist_raw
 
     if pc.add_level:
@@ -655,12 +752,24 @@ def generate_shadow_gaussians(pc, light_position, anchor_indices=None,
     scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
     scale_rot = scale_rot.reshape([anchor.shape[0] * pc.n_offsets, 7])
 
-    grid_offsets = _idx(pc._offset)
+    K = pc.n_offsets
+    if indices is None:
+        grid_offsets = pc._offset
+    elif isinstance(indices, np.ndarray):
+        shadow_offset_indices = (
+            np.repeat(indices * K, K) + np.tile(np.arange(K), len(indices))
+        )
+        grid_offsets = _safe_index(pc._offset, shadow_offset_indices)
+    else:
+        shadow_offset_indices = (
+            (indices * K).unsqueeze(1).repeat(1, K) + jt.arange(K)
+        ).reshape(-1)
+        grid_offsets = _safe_index(pc._offset, shadow_offset_indices)
+    grid_offsets = grid_offsets.reshape([anchor.shape[0], K, 3])
     grid_rotation = _idx(pc._rotation)
     grid_scaling = _idx(pc.get_scaling)
     offsets = grid_offsets.view([-1, 3])
 
-    K = pc.n_offsets
     N_anchor = anchor.shape[0]
     _expand_np = np.arange(N_anchor, dtype=np.int32).repeat(K)
     scaling_expanded = grid_scaling[_expand_np]              # [N*K, 6]
@@ -685,12 +794,16 @@ def scale_loss(scaling):
 
     _, sorted_scale = jt.argsort(scaling, dim=-1)
     min_scale_loss = sorted_scale[...,0]
-    loss_scale = 100.0*min_scale_loss.mean()
+    # This reduction spans every visible Gaussian.  Jittor 1.3.11's FP32 GPU
+    # reduction produced different scalar values from identical arrays in
+    # independent resume processes, so use the audited FP64 accumulator while
+    # retaining a connected FP32 scalar for the training graph.
+    loss_scale = 100.0 * _stable_full_mean(min_scale_loss)
 
     return loss_scale
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scaling_modifier=1.0, visible_mask=None,is_pbr=False,light=None, retain_grad=False, is_training =True, Local_pkg=None,iteration = 0,ape_code=-1, normalize_for_light=False, return_aux=True, normal_smooth_weight=0.0, return_light_components=False, shadow_ctx=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scaling_modifier=1.0, visible_mask=None,is_pbr=False,light=None, retain_grad=False, is_training =True, Local_pkg=None,iteration = 0,ape_code=-1, normalize_for_light=False, return_aux=True, normal_smooth_weight=0.0, return_light_components=False, shadow_ctx=None, trace_intermediates=False):
     """
     Render the scene. 
     
@@ -698,10 +811,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
     """
 
     # if is_training:
-    xyz, color, opacity, scaling, rot, neural_opacity, mask, albedo, roughness, matallic,normal,delta_normal_norm,local_loss,sdf_loss = generate_neural_gaussians(
+    generated = generate_neural_gaussians(
         viewpoint_camera, pc, visible_mask, is_training=is_training,
         is_pbr=is_pbr, iteration=iteration, ape_code=ape_code,
-        normal_smooth_weight=normal_smooth_weight)
+        normal_smooth_weight=normal_smooth_weight,
+        trace_intermediates=trace_intermediates)
+    if trace_intermediates:
+        (xyz, color, opacity, scaling, rot, neural_opacity, mask, albedo,
+         roughness, matallic, normal, delta_normal_norm, local_loss, sdf_loss,
+         decoder_trace) = generated
+    else:
+        (xyz, color, opacity, scaling, rot, neural_opacity, mask, albedo,
+         roughness, matallic, normal, delta_normal_norm, local_loss, sdf_loss) = generated
 
     # scale_loss sorts every Gaussian scale and is only consumed by training.
     loss_scale = scale_loss(scaling) if is_training else jt.float32(0.0)
@@ -717,8 +838,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
     if retain_grad:
         try:
             screenspace_points.retain_grad()
-        except:
-            pass
+        except Exception as exc:
+            raise RuntimeError("failed to retain screen-space gradients") from exc
 
     # Set up rasterization configuration
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
@@ -754,10 +875,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
 
         viewdirs = jt.normalize(viewpoint_camera.camera_center - xyz, p=2, dim=-1)
 
-        # Phase 35: build_mips only once (JIT compiles 41+ fused CUDA kernels, >60s)
-        if not getattr(light, '_mips_built', False):
-            light.build_mips()
-            light._mips_built = True
+        # Training must rebuild from the current optimized base so continuous
+        # and resumed steps share the same derived light state. Inference can
+        # retain the exact-base disk/process cache.
+        if is_training:
+            light.build_mips(training=True)
+        elif not getattr(light, '_mips_built', False):
+            light.build_mips(training=False)
         
         # Keep the historical training path unchanged, but allow relighting
         # inference to provide the unit world-space directions expected by SG
@@ -867,8 +991,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
         emitter_transmit = None
         if shadow_ctx is not None and 'samples' in shadow_ctx:
             emitter_transmit = shadow_ctx['samples']
+        # A model without the optional metallic decoder is a dielectric model.
+        # Keep metallic absent from the exported auxiliary contract, but provide
+        # an explicit zero tensor to the BRDF instead of passing None into its
+        # arithmetic.
+        metallic_for_light = (
+            matallic if pc.with_matallic else jt.zeros_like(roughness))
         light_color, light_extras = light.lightRender(
-            xyz, normal_for_light, albedo, roughness, matallic, viewdirs,
+            xyz, normal_for_light, albedo, roughness, metallic_for_light, viewdirs,
             shadow_cube=shadow_cube, shadow_alpha=shadow_alpha,
             transmit_cube=transmit_cube, transmit_bounds=transmit_bounds,
             transmit_final=transmit_final, emitter_transmit=emitter_transmit,
@@ -878,22 +1008,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
         if not return_light_components:
             del light_extras
 
-        # Phase 39: save lightRender inputs for PBR MLP gradient computation
-        # Phase 78: gated behind is_training — not needed for inference
-        if is_training:
-            pc._diag_data['xyz_light'] = xyz.numpy()
-            pc._diag_data['normal_t_light'] = normal_for_light.numpy()
-            pc._diag_data['albedo_light'] = albedo.numpy()
-            pc._diag_data['roughness_light'] = roughness.numpy()
-            _matallic_np = matallic.numpy() if (matallic is not None) else None
-            pc._diag_data['metallic_light'] = _matallic_np
-            pc._diag_data['viewdirs_light'] = viewdirs.numpy()
-            pc._diag_data['with_matallic'] = pc.with_matallic
-            pc._diag_data['light_obj'] = light
-        # 2026-08-02: viewdirs/normal_for_light only used by lightRender (and the numpy
-        # copies above); release before building features. Inference path is
-        # free to reclaim; training already copied what it needs.
-        del viewdirs, normal_for_light
+        # viewdirs/normal_for_light are no longer needed after lightRender.
+        del viewdirs, normal_for_light, metallic_for_light
 
         if return_aux or is_training:
             if is_training:
@@ -974,7 +1090,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
         inference_only=(not is_training),  # M2 (P0): no tape / no scratch retention in inference
         return_aux=return_aux
     )
-    # Store reference for manual backward (Phase 22).
+    # Keep shape-only rasterizer statistics available until step evidence is written.
     # M2 (P0): only the training path holds these global diagnostic refs — they keep
     # the previous rasterizer (with its huge Geometry/Binning/Image buffers) alive,
     # which caused memory to accumulate across inference views.
@@ -1074,7 +1190,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
             "visibility_filter" : radii > 0,
             "radii": radii,
             "neural_opacity": neural_opacity,
-            "selection_mask": _bool_to_indices(mask),  # numpy int idx (avoids jt.where)
+            "selection_mask": mask,
             "scaling": scaling,
             "normal": rendered_norm,
             "precomput_normal": precomput_normal,
@@ -1088,7 +1204,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
             "sdf_loss":sdf_loss,
             "points":xyz,
             "points_normal":normal,
-            "_diag_data": pc._diag_data if hasattr(pc, '_diag_data') else {},
             **_rq,
             }
         if return_light_components and is_pbr:
@@ -1102,6 +1217,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
                 results["front_pl_image"] = front_pl_image
                 results["veff_pl_image"] = veff_pl_image
         results.update(feature_dict)
+        if trace_intermediates:
+            results["_decoder_intermediates"] = decoder_trace
+            results["_trace_intermediates"] = {
+                "means3D": xyz,
+                "colors_precomp": color,
+                "opacities": opacity,
+                "scales": scaling,
+                "rotations": rot,
+                "extra_attrs": raster_extra_attrs,
+            }
         # 2026-08-02: color/opacity/rot are not referenced by results (scaling,
         # xyz, normal, neural_opacity are). Release them to cut ~400MiB before
         # the caller processes the image. features is kept (rasterizer may hold it).
@@ -1110,11 +1235,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
         return results
 
     else:
-        return {"render": rendered_image,
+        results = {"render": rendered_image,
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,
-            "selection_mask": _bool_to_indices(mask),  # numpy int idx (avoids jt.where)
+            "selection_mask": mask,
             "neural_opacity": neural_opacity,
             "scaling": scaling,
             "normal": rendered_norm,
@@ -1129,10 +1254,20 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var, scalin
             "sdf_loss":sdf_loss,
             "points":xyz,
             "points_normal":normal,
-            "_diag_data": pc._diag_data if hasattr(pc, '_diag_data') else {},
             **_rq,
 
             }
+        if trace_intermediates:
+            results["_decoder_intermediates"] = decoder_trace
+            results["_trace_intermediates"] = {
+                "means3D": xyz,
+                "colors_precomp": color,
+                "opacities": opacity,
+                "scales": scaling,
+                "rotations": rot,
+                "extra_attrs": raster_extra_attrs,
+            }
+        return results
 
 
 def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : jt.Var,anchor_mask=None, scaling_modifier = 1.0, override_color = None):

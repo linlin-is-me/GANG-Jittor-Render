@@ -30,6 +30,29 @@ def jt_erosion2d(x: jt.Var, kernel_size: int = 7) -> jt.Var:
     return -eroded_neg
 
 
+def jt_opencv_binary_erosion(x: jt.Var, kernel_size: int = 4) -> jt.Var:
+    """Match ``cv2.erode`` for a square uint8 binary mask.
+
+    OpenCV places the anchor at ``(kernel_size // 2, kernel_size // 2)``
+    for an even kernel and uses the morphology default high border value for
+    erosion.  The asymmetric pad below reproduces that output size and anchor
+    without a device-to-host mask conversion.
+    """
+    if x.ndim != 4:
+        raise ValueError(f"binary erosion expects [N,C,H,W], got {x.shape}")
+    if kernel_size <= 0:
+        raise ValueError("erosion kernel size must be positive")
+    anchor = kernel_size // 2
+    trailing = kernel_size - 1 - anchor
+    padded = F.pad(
+        x.float(),
+        (anchor, trailing, anchor, trailing),
+        mode='constant',
+        value=1.0,
+    )
+    return -F.max_pool2d(-padded, kernel_size, stride=1, padding=0)
+
+
 def jt_spatial_gradient(x: jt.Var, order: int = 1) -> jt.Var:
     """Compute spatial gradients of a tensor.
 

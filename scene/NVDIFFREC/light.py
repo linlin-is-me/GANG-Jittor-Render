@@ -8,6 +8,7 @@
 # its affiliates is strictly prohibited.
 
 import os
+from pathlib import Path
 import numpy as np
 import jittor as jt
 from jittor import nn
@@ -43,7 +44,6 @@ def _sg_dot3(a, b, backend):
     return dot3(a, b)
 
 
-
 def _sg_norm3(a, backend):
     if backend == 'native':
         return jt.norm(a, dim=-1, keepdim=True)
@@ -51,7 +51,6 @@ def _sg_norm3(a, backend):
     # jt.norm(p=2) clamps the squared sum before sqrt, in addition to the
     # caller's denominator epsilon. Preserve both protections independently.
     return norm3(a, eps=1e-30)
-
 
 
 ######################################################################################
@@ -71,7 +70,10 @@ class cubemap_mip(jt.Function):
                                     )
                                     # indexing='ij')
             v = util.safe_normalize(util.cube_to_dir(s, gx, gy))
-            out[s, ...] = dr.texture(dout[None, ...] * 0.25, v[None, ...].contiguous(), filter_mode='linear', boundary_mode='cube')
+            out[s, ...] = dr.texture(
+                dout[None, ...] * 0.25,
+                v[None, ...].contiguous(),
+                filter_mode='linear', boundary_mode='cube')[0]
         return out
 
 ######################################################################################
@@ -117,7 +119,8 @@ class Hybridlight(nn.Module):
                  inital_position = None,
                  upper_hemi = False,
                  is_white_light = False,
-                 cache_dir = None):
+                 cache_dir = None,
+                 rng = None):
         super(Hybridlight, self).__init__()
         self.mtx = None
         self._cache_dir = cache_dir or '.'
@@ -129,18 +132,20 @@ class Hybridlight(nn.Module):
         self.sg_clamp_diffuse = True
         self.sg_reduce_backend = 'native'
 
-        # Experimental point-light path for relighting inference. It is disabled
-        # by default and is not part of checkpoint training or baseline replay.
+        # Point-light path (relight inference only, not used by training).
+        # Set point_light_enabled=True + position/color/intensity/radius to add a
+        # true per-Gaussian point light (inverse-square + finite radius), see
+        # OLDLIGHT_POINT_LIGHT_DIAGNOSIS.md. Disabled by default.
         self.point_light_enabled = False
         self.point_light_position = None   # [3] world-space lamp position
         self.point_light_color = None      # [3] RGB warm bulb colour
         self.point_light_intensity = 1.0   # scalar, lamp "wattage"
         self.point_light_radius = 0.5      # scalar, finite glowing radius (softens near-field)
 
-        # Phase 35: Use numpy RNG for deterministic cubemap (cacheable across runs).
-        # jt.rand() is non-deterministic → different cache key each run.
-        np.random.seed(42)
-        base_np = (np.random.rand(6, base_res, base_res, 3).astype(np.float32) * scale + bias)
+        # A dedicated RandomState preserves the historical MT19937 sequence
+        # without resetting the process-global NumPy RNG used by camera sampling.
+        rng = rng if rng is not None else np.random.RandomState(42)
+        base_np = (rng.rand(6, base_res, base_res, 3).astype(np.float32) * scale + bias)
         base = jt.array(base_np)
         self.base = base
         # self.register_parameter('env_base', self.base)
@@ -151,13 +156,13 @@ class Hybridlight(nn.Module):
         # Initialize SG params in numpy (Jittor .data assignment doesn't work)
         if is_white_light:
             print("SG is white light!!")
-            lgt_np = np.random.randn(num_sg, 8).astype(np.float32)  # pos(3)+lobe(3)+lambda(1)+mu(1)
-            spec_np = np.random.randn(numBrdfSGs, 1).astype(np.float32)
+            lgt_np = rng.randn(num_sg, 8).astype(np.float32)  # pos(3)+lobe(3)+lambda(1)+mu(1)
+            spec_np = rng.randn(numBrdfSGs, 1).astype(np.float32)
             energy_offset = 6  # lambda at col 6, mu at col 7
         else:
-            lgt_np = np.random.randn(num_sg, 10).astype(np.float32)  # pos(3)+lobe(3)+lambda(1)+mu(3)
+            lgt_np = rng.randn(num_sg, 10).astype(np.float32)  # pos(3)+lobe(3)+lambda(1)+mu(3)
             lgt_np[:, -2:] = lgt_np[:, -3:-2]  # copy to last 2 cols
-            spec_np = np.random.randn(numBrdfSGs, 3).astype(np.float32)
+            spec_np = rng.randn(numBrdfSGs, 3).astype(np.float32)
             energy_offset = 6  # lambda at col 6, mu at cols 7-9
         spec_np = np.abs(spec_np)
 
@@ -191,22 +196,55 @@ class Hybridlight(nn.Module):
         self.specular_reflectance = jt.array(spec_np)
 
         # optimize
-        roughness = [np.random.uniform(1.5, 2.0) for i in range(numBrdfSGs)]           # big roughness
+        roughness = [rng.uniform(1.5, 2.0) for i in range(numBrdfSGs)]           # big roughness
         roughness = np.array(roughness).astype(dtype=np.float32).reshape((numBrdfSGs, 1))  # [K, 1]
         print('init SG roughness: ', 1.0 / (1.0 + np.exp(-roughness)))
         self.roughness = jt.array(roughness)
 
 
-    def training_setup(self,training_args):
+    def training_setup(
+        self, training_args, *, adam_eps=1e-15, adam_betas=(0.9, 0.999)
+    ):
+
+        # The checked-out GANG lightRender path does not read these two legacy
+        # BRDF-SG members: sg_render derives roughness from the Gaussian MLP and
+        # assigns its local specular_reflectance from albedo_sg.  PyTorch leaves
+        # their gradients as None, so keep them in the checkpointed optimizer
+        # but make Jittor Adam skip them as well.
+        self.roughness.stop_grad()
+        self.specular_reflectance.stop_grad()
 
         l = [
-            {'params': self.base, 'lr': training_args.env_map_init, "name": "Envmap"},
-            {'params': self.lgtSGs, 'lr': training_args.sg_init, "name": "SGLight"},
-            {'params': self.roughness,'lr': training_args.sg_init, "name": "sg_roughness"},
-            {'params': self.specular_reflectance, 'lr': training_args.sg_init, "name": "specular_reflectance"},
+            {'params': [self.base], 'lr': training_args.env_map_init, "name": "Envmap"},
+            {'params': [self.lgtSGs], 'lr': training_args.sg_init, "name": "SGLight"},
+            {'params': [self.roughness], 'lr': training_args.sg_init, "name": "sg_roughness"},
+            {'params': [self.specular_reflectance], 'lr': training_args.sg_init, "name": "specular_reflectance"},
         ]
 
-        self.optimizer = jt.optim.Adam(l, lr=0.0, eps=1e-8)
+        betas = tuple(float(value) for value in adam_betas)
+        if len(betas) != 2:
+            raise ValueError("Adam requires exactly two beta values")
+        self.optimizer = jt.optim.Adam(
+            l, lr=0.0, eps=float(adam_eps), betas=betas)
+        step_scope = str(getattr(training_args, "adam_step_scope", "global"))
+        if step_scope not in {"global", "per_group"}:
+            raise ValueError(f"unsupported Adam step scope: {step_scope}")
+        self.optimizer.adam_step_scope = step_scope
+        epsilon_placement = str(getattr(
+            training_args, "adam_epsilon_placement",
+            "jittor_uncorrected_denominator"))
+        if epsilon_placement not in {
+                "jittor_uncorrected_denominator",
+                "pytorch_bias_corrected_denominator"}:
+            raise ValueError(f"unsupported Adam epsilon placement: {epsilon_placement}")
+        if (epsilon_placement == "pytorch_bias_corrected_denominator"
+                and step_scope != "per_group"):
+            raise ValueError(
+                "PyTorch-equivalent Adam epsilon placement requires per-group steps")
+        self.optimizer.adam_epsilon_placement = epsilon_placement
+        if step_scope == "per_group":
+            for group in self.optimizer.param_groups:
+                group["adam_step"] = 0
 
         self.env_light_scheduler = get_expon_lr_func(lr_init=training_args.env_map_init,
                                                          lr_final=training_args.env_map_final,
@@ -233,7 +271,45 @@ class Hybridlight(nn.Module):
         self.mtx = mtx
 
     def clone(self):
-        return Hybridlight(self.base.clone().detach())
+        """Return an optimizer-free copy with the complete light state."""
+        clone = Hybridlight(
+            base_res=int(self.base.shape[1]),
+            num_sg=int(self.lgtSGs.shape[0]),
+            numBrdfSGs=int(self.specular_reflectance.shape[0]),
+            upper_hemi=bool(self.upper_hemi),
+            is_white_light=bool(self.white_light),
+            cache_dir=self._cache_dir,
+            rng=np.random.RandomState(0),
+        )
+        clone.base = self.base.clone().detach()
+        clone.lgtSGs = self.lgtSGs.clone().detach()
+        clone.specular_reflectance = self.specular_reflectance.clone().detach()
+        clone.roughness = self.roughness.clone().detach()
+        clone.numLgtSGs = int(clone.lgtSGs.shape[0])
+        clone.mtx = self.mtx.clone().detach() if isinstance(self.mtx, jt.Var) else self.mtx
+
+        # Copy the rendering controls that are independent of optimizer state.
+        for name in (
+            "sg_distance_attenuation", "sg_min_roughness", "sg_clamp_diffuse",
+            "point_light_enabled", "point_light_intensity", "point_light_radius",
+        ):
+            setattr(clone, name, getattr(self, name))
+        for name in ("point_light_position", "point_light_color"):
+            value = getattr(self, name)
+            if isinstance(value, jt.Var):
+                value = value.clone().detach()
+            elif isinstance(value, np.ndarray):
+                value = value.copy()
+            setattr(clone, name, value)
+
+        # Derived mip tensors are safe to share only by value.  Copy them when
+        # they already exist; otherwise the clone will build them from base.
+        if hasattr(self, "specular"):
+            clone.specular = [value.clone().detach() for value in self.specular]
+        if hasattr(self, "diffuse"):
+            clone.diffuse = self.diffuse.clone().detach()
+        clone._mips_built = bool(getattr(self, "_mips_built", False))
+        return clone
 
     def clamp_(self, min=None, max=None):
         self.base.clamp_(min, max)
@@ -257,32 +333,52 @@ class Hybridlight(nn.Module):
         print("  Light state restored from checkpoint")
 
     def load_light(self, filepath,is_training=False):
-        assert(filepath.endswith('.npy'))
-
-        print("load Light paramer!!")
-
-
-        light_dict = np.load(filepath, allow_pickle=True)
-        lgtSG = light_dict.item()["lgtSGs"]
-        base = light_dict.item()["base"]
-        specular_reflectance = light_dict.item()["specular_reflectance"]
-        sg_roughness = light_dict.item()["sg_roughness"]
-
-        self.lgtSGs = jt.array(lgtSG)
-        self.base = jt.array(base)
-        self.specular_reflectance = jt.array(specular_reflectance)
-        self.roughness = jt.array(sg_roughness)
+        if not filepath.endswith('.npz'):
+            raise ValueError('light loading accepts only non-object NPZ files')
+        with np.load(filepath, allow_pickle=False) as light_dict:
+            required = {'lgtSGs', 'base', 'specular_reflectance', 'sg_roughness'}
+            missing = sorted(required - set(light_dict.files))
+            if missing:
+                raise ValueError(f'light file is missing arrays: {missing}')
+            self.lgtSGs = jt.array(np.asarray(light_dict['lgtSGs'], dtype=np.float32))
+            self.base = jt.array(np.asarray(light_dict['base'], dtype=np.float32))
+            self.specular_reflectance = jt.array(
+                np.asarray(light_dict['specular_reflectance'], dtype=np.float32))
+            self.roughness = jt.array(
+                np.asarray(light_dict['sg_roughness'], dtype=np.float32))
         self.numLgtSGs = self.lgtSGs.shape[0]
 
     def save_light(self,path):
-        result = {}
-        result["lgtSGs"] = self.lgtSGs.detach().numpy()
-        result["base"] = self.base.detach().numpy()
-        result["specular_reflectance"] = self.specular_reflectance.detach().numpy()
-        result["sg_roughness"] = self.roughness.detach().numpy()
-        np.save(path,result)
+        if not path.endswith('.npz'):
+            raise ValueError('light saving requires a .npz path')
+        np.savez_compressed(
+            path,
+            lgtSGs=self.lgtSGs.detach().numpy(),
+            base=self.base.detach().numpy(),
+            specular_reflectance=self.specular_reflectance.detach().numpy(),
+            sg_roughness=self.roughness.detach().numpy())
 
-    def build_mips(self, cutoff=0.99):
+    def build_mips(self, cutoff=0.99, training=False):
+        if training:
+            # GANG-master and JGaussian rebuild the differentiable hierarchy
+            # before every training render. Reusing it after Adam updates makes
+            # continuous and resumed execution observe different light values.
+            self.specular = [self.base]
+            while self.specular[-1].shape[1] > self.LIGHT_MIN_RES:
+                self.specular.append(cubemap_mip.apply(self.specular[-1]))
+            self.diffuse = diffuse_cubemap(self.specular[-1])
+            n_levels = len(self.specular)
+            for idx in range(n_levels - 1):
+                roughness = ((idx / (n_levels - 2)) *
+                             (self.MAX_ROUGHNESS - self.MIN_ROUGHNESS) +
+                             self.MIN_ROUGHNESS) if n_levels > 2 else self.MIN_ROUGHNESS
+                self.specular[idx] = specular_cubemap(
+                    self.specular[idx], roughness, cutoff)
+            self.specular[-1] = specular_cubemap(
+                self.specular[-1], 1.0, cutoff)
+            self._mips_built = True
+            return
+
         # Phase 35: Check disk cache first to avoid slow numpy specular_cubemap.
         # specular_cubemap at res=256 takes hours in pure numpy.
         # The cubemap depends only on self.base (SG initialization), which is
@@ -294,10 +390,10 @@ class Hybridlight(nn.Module):
         cache_path = os.path.join(cache_dir, 'pbr_cache', f'mips_{self.base.shape[1]}_{base_hash}.npz')
 
         if os.path.exists(cache_path):
-            data = dict(np.load(cache_path, allow_pickle=True))
-            n_mips = int(data['n_mips'])
-            self.specular = [jt.array(data[f'specular_{i}']) for i in range(n_mips)]
-            self.diffuse = jt.array(data['diffuse'])
+            with np.load(cache_path, allow_pickle=False) as data:
+                n_mips = int(data['n_mips'])
+                self.specular = [jt.array(data[f'specular_{i}']) for i in range(n_mips)]
+                self.diffuse = jt.array(data['diffuse'])
             self._mips_built = True   # M5 (P1): set on the disk-cache branch too
             return
 
@@ -425,12 +521,6 @@ class Hybridlight(nn.Module):
         else:
             specular_rgb_sg = jt.zeros_like(albedo)
             diffuse_rgb_sg = jt.zeros_like(albedo)
-        # Phase 91: force sync+gc to free sg_render intermediates (~8GB [N,16,3] tensors)
-        # before envmap cubemap rendering allocates more.
-        # 2026-08-02: jt.sync_all(True) waits for device before SFRL reclaim.
-        if self.numLgtSGs > 0:
-            jt.sync_all(True); jt.gc()
-
         if is_env:
             normals = normal.reshape(1, N, 3)
             view_dirs = viewdirs.reshape(1, N, 3)
@@ -446,17 +536,16 @@ class Hybridlight(nn.Module):
             diffuse_light = dr.texture(self.diffuse[None, ...], normals[None, ...].contiguous(), filter_mode='linear',
                                     boundary_mode='cube')
             diffuse_rgb = diffuse_light * diff_col
-            # 2026-08-02: diff_col/diffuse_light are only used here; release before
-            # specular allocates more. diffuse_rgb is still needed at render_rgb.
+            # diff_col/diffuse_light are no longer used after diffuse_rgb.
             del diff_col, diffuse_light
-            jt.sync_all(True); jt.gc()  # free diffuse cubemap intermediates
 
             # specular
             NoV = jt.clamp(util.dot(view_dirs, normals), 1e-4, 1.0)
             fg_uv = jt.concat((NoV, roughness), dim=-1)  # [1, N, 2]
             if not hasattr(self, '_FG_LUT'):
+                lut_path = Path(__file__).resolve().parent / 'irrmaps' / 'bsdf_256_256.bin'
                 self._FG_LUT = jt.array(
-                    np.fromfile('scene/NVDIFFREC/irrmaps/bsdf_256_256.bin', dtype=np.float32).reshape(1, 256, 256,2),
+                    np.fromfile(lut_path, dtype=np.float32).reshape(1, 256, 256, 2),
                     dtype=jt.float32)
             fg_lookup = dr.texture(
                 self._FG_LUT,  # [1, 256, 256, 2]
@@ -473,7 +562,6 @@ class Hybridlight(nn.Module):
             # 2026-08-02: ref_dirs/fg_uv/NoV/miplevel no longer needed after spec
             # sampled. fg_lookup (L422) and spec (L425) are still used — keep.
             del ref_dirs, fg_uv, NoV, miplevel
-            jt.sync_all(True); jt.gc()  # free specular mipmap cubemap intermediates
 
             F0 = (1.0 - metallic) * 0.04 + albedo * metallic
            
@@ -503,7 +591,6 @@ class Hybridlight(nn.Module):
             # extras already extracted [0,0] slices; del originals is safe.
             del normals, view_dirs, albedo, roughness, metallic, diffuse_rgb, \
                 fg_lookup, spec, F0, reflectance, specular_rgb
-            jt.sync_all(True); jt.gc()
         
         else:
             extras = {"specular_rgb": specular_rgb_sg,"diffuse_rgb": diffuse_rgb_sg,
@@ -631,7 +718,6 @@ class Hybridlight(nn.Module):
             warpBrdfSGMus, new_half, v_dot_h, F, k, G1, G2, G, Moi, H1, H2, \
             final_lobes, final_lambdas, final_mus, lobe_prime, lambda_prime, mu_prime, \
             dot1, dot2, specular_reflectance
-        jt.sync_all(True); jt.gc()
         # diffuse color
         diffuse = (1-metallic_sg)*albedo_sg / np.pi  # [N, M, 3]
        
@@ -817,7 +903,7 @@ class Hybridlight(nn.Module):
         return vis, T_lo, T_interp, T_hi, bounds, bias
 
     def point_light_render(self, points, normal, albedo, roughness, metallic, viewdirs, shadow_cube=None, shadow_alpha=None, transmit_cube=None, transmit_bounds=None, transmit_final=None, emitter_transmit=None, receiver_transmittance=None):
-        """Evaluate a point light independently at each Gaussian centre.
+        """True per-Gaussian point light (OLDLIGHT_POINT_LIGHT_DIAGNOSIS.md §4.2).
 
         Unlike the positional-SG approximation (fixed lobe + exp(-0.4d) weight),
         this computes a per-Gaussian incident direction to a lamp at
@@ -919,11 +1005,12 @@ class Hybridlight(nn.Module):
         # radius-protected inverse-square: prevents /0 and softens near-field lamp.
         atten = sample_intensity / jt.maximum(dist * dist, float(self.point_light_radius) ** 2)
         radiance = self.point_light_color.unsqueeze(0) * atten                # [G,3]
-        # Match sg_render's roughness floor so low-roughness Gaussians cannot
-        # produce extreme GGX specular spikes near the lamp.
+        # P0 (POINT_LIGHT_RENDER_QUALITY_FIX_PLAN.md §4.4): apply the roughness
+        # floor like sg_render does, so low-roughness Gaussians cannot produce
+        # extreme GGX specular spikes near the lamp.
         rough = roughness.clamp(float(self.sg_min_roughness), 1.0)
-        # Use explicit cosine terms and a front-face mask. Do not reuse the
-        # module-level saturate_dot: its 1e-4 floor keeps back-facing
+        # P0 (§3.2/3.3): explicit cosine terms + front-face mask. Do NOT reuse
+        # the module-level saturate_dot — its 1e-4 floor keeps back-facing
         # Gaussians alive and inflates grazing-angle specular. SG/env paths
         # are untouched.
         NoL_raw = jt.sum(normal * L, dim=-1, keepdim=True)                    # [G,1]
@@ -1093,16 +1180,16 @@ class Hybridlight(nn.Module):
     def _point_light_render_area(self, points, normal, albedo, roughness, metallic,
                                  viewdirs, S, eradius, transmit_cube, transmit_final,
                                  transmit_bounds, emitter_transmit):
-        """Finite-emitter area light. `emitter_transmit` is a list
+        """N4-R0 (§25.4): finite-emitter area light. `emitter_transmit` is a list
         of STRUCTURED per-sample contexts {index, position, position_hash,
         transmit_cube, transmit_final, transmit_bounds, bounds_hash, shadow_meta};
         when None the shared-center visibility (stage-1 sharedvis) is used.
 
-        The BRDF sample positions always come from the shared
-        `point_emitter_positions`, populated with `make_emitter_samples`; they
-        are never resampled here. Total flux stays
+        The BRDF sample positions ALWAYS come from the shared
+        `point_emitter_positions` (set once by _relight_views via
+        make_emitter_samples) — never re-sampled here. Total flux stays
         `intensity` (each sample carries intensity/S). Direct light is
-        accumulated independently for every emitter sample."""
+        accumulated per-sample: direct = Σ_s [direct_s × visibility_s]."""
         G = points.shape[0]
         per_sample = (emitter_transmit is not None)
         _lpos = np.asarray(self.point_light_position.numpy(), np.float32).reshape(-1)
@@ -1350,8 +1437,14 @@ def save_env_map(fn, light):
 ######################################################################################
 
 def create_trainable_env_rnd(base_res, scale=0.5, bias=0.25):
+    if isinstance(base_res, bool) or not isinstance(base_res, (int, np.integer)) \
+            or int(base_res) <= 0:
+        raise ValueError("base_res must be a positive integer")
+    base_res = int(base_res)
     base = jt.rand(6, base_res, base_res, 3, dtype=jt.float32) * scale + bias
-    return Hybridlight(base)
+    light = Hybridlight(base_res=base_res, scale=scale, bias=bias)
+    light.base = base.start_grad()
+    return light
 
 def extract_env_map(light, resolution=[512, 1024]):
     assert isinstance(light, Hybridlight), "Can only save EnvironmentLight currently"
