@@ -4,13 +4,22 @@ GANG-Jittor-Render 在计图深度学习框架与 JGaussian 渲染库的基础�
 
 我们针对复杂场景优化光照计算。在同一块 NVIDIA RTX 4090 上，计图渲染器保持了与 PyTorch 原版接近的平均重建质量，完整前向耗时从 **87.83 ms/帧降至 59.63 ms/帧**，推理速度达到 **16.77 FPS**，显存采样峰值降低约 **40.6%**。测试条件与复现入口见下文。
 
+[效果展示](#gallery) · [质量与速度](#results) · [快速开始](#quick-start) · [技术实现](#implementation) · [使用范围](#scope) · [相关资料](#references)
+
+<a id="gallery"></a>
+
 ![Garden DSC08066 在原始学习环境光及 14 张外部 HDR 环境贴图下的重光照效果](assets/envmap_relighting_garden_dsc08066_3x5.png)
 
 固定模型、材质与相机，仅替换环境贴图。第一格为模型学习到的环境光，其余为 14 张 TensoIR HDR；右下角展示实际使用的环境贴图。该展示关闭 SG 与点光源，采用固定线性裁剪显示，外部 HDR 的能量差异可能造成高亮截断。
 
-下图展示 Garden 场景的 24 个测试视角，呈现不同观察方向下的场景结构、材质细节与整体重建效果。
+<details>
+<summary>查看全部 24 个视角的渲染结果</summary>
+
+下图展示 Garden 场景在不同观察方向下的结构、材质细节与整体重建效果。
 
 ![Garden 场景的 24 个测试视角渲染总览](assets/garden_multiview_24views.jpg)
+
+</details>
 
 ## Part 1 从 3DGS 到场景级可重光照
 
@@ -34,13 +43,15 @@ GANG 将 cubemap 环境光与球面高斯（SG）局部光照结合。环境贴�
 
 ![多球面高斯混合光照示意图](assets/图%204多球面高斯混合光照示意图.png)
 
+<a id="implementation"></a>
+
 ## Part 2 计图渲染管线的实现与优化
 
 ### 2.1 从预训练模型到计图推理
 
 本项目复用 JGaussian 的 CUDA 光栅化器框架、环境光模型与 BRDF 查找表积分（FG_LUT）等基础能力，接入 GANG 所需的材质与光照分量。推理路径直接调用 CUDA 前向，不建立 Tape，也不保留反向传播缓存；按阶段释放中间张量，减少多视角渲染的显存占用。
 
-仓库提供 `.pth → .npz` 转换工具，配套转换原版 GANG PBR 模型与灯光状态。已有预训练权重完成格式转换后，即可载入计图渲染器，无需重新训练。转换阶段需要 PyTorch，推理阶段不需要。支持的检查点结构、LOD 元数据与使用方式见 [检查点转换说明](docs/checkpoint_conversion.md)。
+仓库提供 `.pth → .npz` 转换工具，配套转换原版 GANG PBR 模型与灯光状态，便于复用预训练权重，无需重新训练。支持的结构与 LOD 元数据要求见 [检查点转换说明](docs/checkpoint_conversion.md)。
 
 ### 2.2 锚点式 PBR 材质解码
 
@@ -58,7 +69,9 @@ GANG 将 cubemap 环境光与球面高斯（SG）局部光照结合。环境贴�
 
 原版 GANG 使用 nvdiffrast 完成环境纹理查询。我们在计图中实现所需的纹理采样，支持二维纹理、cubemap 跨面插值与多级 mipmap 查询，兼顾环境光照的连续性和不同粗糙度下的镜面反射表现。
 
-该实现既能还原模型学习到的环境光，也支持替换外部 HDR 环境贴图，呈现场景在不同照明条件下的材质与光影变化。渲染运行时不再依赖 PyTorch 或 nvdiffrast；CUDA 高斯光栅库仍需按下文从源码编译。
+该实现既能还原模型学习到的环境光，也支持替换外部 HDR 环境贴图，呈现场景在不同照明条件下的材质与光影变化。
+
+<a id="results"></a>
 
 ## Part 3 渲染质量与推理速度
 
@@ -90,9 +103,9 @@ PSNR 衡量像素误差，SSIM 衡量结构相似性，均越高越好；LPIPS �
 
 完整前向耗时是生成一帧所需的计算时间，FPS 表示每秒可生成的帧数；显存采样峰值是测试期间采样记录的最高显存占用。
 
-测试表明，在上述条件下，计图渲染器保持了与 PyTorch 原版接近的平均重建质量，同时降低完整前向耗时与显存占用，为场景级重光照提供更高效的推理支持。
-
 以上为固定测试环境下的实测结果。完整统计、逐帧记录、独立光栅器与 RGB-only 路径的结果，以及复现条件见 [实测版本说明](docs/measured_inference.md) 和 [原始统计](docs/benchmarks/20260908/three_run_summary.json)。不同 GPU、驱动与软件环境下的速度可能不同。
+
+<a id="quick-start"></a>
 
 ## 快速开始
 
@@ -126,7 +139,7 @@ python tools/render_measured.py --weights /path/to/garden_40k \
 
 ### 转换权重与渲染
 
-转换器支持文档列出的原版 GANG PBR capture、配套灯光和显式 LOD 元数据，不支持任意 PyTorch 模型，也不用于跨框架续训。请先按 [检查点转换说明](docs/checkpoint_conversion.md) 准备输入并确认材质参数顺序。
+请按 [检查点转换说明](docs/checkpoint_conversion.md) 准备模型、灯光与 LOD 元数据，并确认材质参数顺序。转换器不支持任意 PyTorch 模型，也不用于跨框架续训。
 
 建议在已安装 PyTorch 和 NumPy 的独立环境中执行转换命令，生成 NPZ 后，再切换到计图推理环境执行渲染命令。上文的安装步骤仅配置计图推理环境。
 
@@ -168,14 +181,17 @@ python tools/relight_envmap.py \
 
 示例下标 120 对应首页实验的 DSC08066；更换相机清单时应核对下标。脚本保存图像、线性 HDR 数组、A/B 对比图和参数记录。批量替换 HDR 时建议每张使用独立进程与输出目录，避免多套环境纹理同时驻留显存。
 
+<a id="scope"></a>
+
 ## 使用范围
 
 - 本仓库提供推理与重光照工具，不提供完整训练入口。
-- 普通可视化入口与固定测速入口具有不同的相机、显示和加载约定；复现 59.63 ms/帧对应的测试应使用 `render_measured.py`。
-- 命名 NPZ 与旧 item-sequence NPZ 不可混用。模型未保存的 LOD 状态需要另行提供；转换器对 `_extra_level` 的处理见转换文档。
+- 命名 NPZ 与旧 item-sequence NPZ 不可混用；缺失状态及 `_extra_level` 的处理见 [转换文档](docs/checkpoint_conversion.md)。
 - 标准 SG 路径不计算遮挡可见性。点光源与阴影属于默认关闭的实验分支，不属于本页的质量与速度结论。
 - 公开 PBR 入口保留原模型的法线约定，环境贴图替换不改变模型材质或法线。
 - 当前许可证仅允许非商业研究和评估用途，具体条款见 [LICENSE](LICENSE)。
+
+<a id="references"></a>
 
 ## 相关资料
 
